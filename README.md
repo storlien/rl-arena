@@ -97,8 +97,12 @@ a TITAN X — 0.15 s forward + 0.23 s backward + 0.34 s critic training —
 so 500 episodes ≈ 6 minutes, exactly the extent of Figure 4's CartPole
 wall-clock axis.)
 
-**Training progression** (return vs episode / vs env steps, losses,
-diagnostics — from `scripts/plot_training.py`):
+**Training progression** (return vs simulation steps (×10⁵) and vs
+wall-clock time — the two axes of the paper's Figure 4 — plus losses and
+diagnostics, from `scripts/plot_training.py`; curves are smoothed — a
+rolling mean for the returns, a rolling median for the spike-dominated
+loss/gradient series — the single-seed counterpart of the paper's 5-seed
+averaging; `--smooth 0` shows the raw per-episode values):
 
 ![SHAC CartPole training curves](figures/cartpole_500ep_training.png)
 
