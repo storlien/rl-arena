@@ -80,26 +80,36 @@ number that **approaches 0 as the policy gets better**:
 
 ---
 
-## Results (3000-episode run)
+## Results (paper-budget 500-episode run)
 
-A full run with the default paper hyperparameters (seed 0, CPU only,
-`--threads 1`): 3000 learning episodes ≈ 6.1M environment steps in
-**7.9 minutes**. The policy reliably swings up and balances from around
-episode 600 onward (first evaluation above −300); the best evaluation
-return is **−243** (episode 2390). The remaining distance to 0 is
-mostly the *swing-up transient itself*: every episode starts with the pole
-hanging (−π), and the energetic swing-up costs a few hundred return
-points before the near-zero-cost balance phase begins.
+A run with the paper's exact CartPole training budget — the Table 4
+hyperparameters (seed 0, CPU only, `--threads 1`): **500 learning
+episodes × 64 parallel environments × 32-step short-horizon windows =
+1,024,000 environment steps**, the ~10⁶ total spanned by the CartPole
+panel of the paper's Figure 4. On CPU this takes **79 seconds**; the
+best evaluation return is **−291** (at the final episode). The distance
+to 0 is mostly the *swing-up transient itself*: every episode starts
+with the pole hanging (−π), and the energetic swing-up costs a few
+hundred return points before the near-zero-cost balance phase begins.
+
+(For scale: the paper's Table 12 reports 0.72 s per learning episode on
+a TITAN X — 0.15 s forward + 0.23 s backward + 0.34 s critic training —
+so 500 episodes ≈ 6 minutes, exactly the extent of Figure 4's CartPole
+wall-clock axis.)
 
 **Training progression** (return vs episode / vs env steps, losses,
 diagnostics — from `scripts/plot_training.py`):
 
-![SHAC CartPole training curves](figures/cartpole_3000ep_training.png)
+![SHAC CartPole training curves](figures/cartpole_500ep_training.png)
 
 **Learned policy in action** (deterministic evaluation episode from
 `scripts/render_policy.py`, rendered from the best checkpoint):
 
-![Learned swing-up and balance policy](figures/cartpole_3000ep_rollout.gif)
+![Learned swing-up and balance policy](figures/cartpole_500ep_rollout.gif)
+
+Training 6× longer (`--episodes 3000`, 6.1M steps, ~8 min on this CPU)
+tightens the best evaluation return to −243 and centers the cart about
+twice as well while balancing.
 
 ---
 
