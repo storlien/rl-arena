@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- SHAC experiment outputs ---
+runs/
+*.pt
+*.gif
+*.png
+!figures/*.png
+!figures/*.gif

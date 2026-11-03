@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# Project definition for `uv` (https://docs.astral.sh/uv/).
+#
+# `uv` manages everything: the Python interpreter, the virtual environment
+# (.venv/), and the exact dependency versions (uv.lock). You never need to
+# activate the venv or call pip -- just use `uv run <command>` and uv makes
+# sure the environment exists and is up to date first.
+#
+#   uv sync          # create/update .venv (one-time setup, ~200 MB)
+#   uv run <cmd>     # run anything inside that environment
+#
+# CPU vs GPU torch: the DEFAULT is the CPU-only build (a ~10x smaller
+# install than the CUDA build, and all CartPole at N=64 ever needs).
+# Switching to the CUDA build for GPU training is a one-line edit -- see
+# the GPU SWITCH note under [tool.uv.sources] below.
+# ---------------------------------------------------------------------------
+
+[project]
+name = "shac"
+version = "0.1.0"
+description = "SHAC (Short-Horizon Actor-Critic, Xu et al., ICLR 2022) on a differentiable CartPole Swing-Up task"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Which torch wheel this resolves to (CPU vs CUDA build) is decided by
+    # the single line under [tool.uv.sources] below.
+    "torch>=2.0",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    # matplotlib's GIF writer (PillowWriter in scripts/render_policy.py)
+    # needs Pillow; matplotlib does not pull it in by itself.
+    "pillow>=10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Only the `shac` package goes into the wheel (scripts/ and tests/ stay out).
+[tool.hatch.build.targets.wheel]
+packages = ["shac"]
+
+[tool.uv.sources]
+# WHERE torch comes from.
+#
+# DEFAULT (CPU): the CPU-only wheel from PyTorch's own index -- all you
+# need for CartPole, and a much smaller download than the CUDA build.
+torch = { index = "pytorch-cpu" }
+
+# GPU SWITCH (for --device cuda training on a CUDA machine):
+#   1. comment out the `torch = { index = "pytorch-cpu" }` line above
+#   2. run:  uv lock && uv sync
+# With no source entry, torch falls back to the default index (PyPI),
+# whose Linux build bundles the CUDA runtime (needs a recent NVIDIA
+# driver). Switch back by restoring the line and re-running
+# `uv lock && uv sync`.
+#
+# Why an edit and not a flag? uv (as of 0.13.x) does not reliably support
+# choosing a package's *index* per extra/group -- the canonical trick from
+# the uv-PyTorch guide (marker'd source entries per extra) silently
+# collapses to a single index for the whole lockfile on this version. A
+# static source line is deterministic: every `uv sync` / `uv run` gives
+# exactly the build this file says, with no surprises.
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+# `explicit`: ONLY packages that name this index (i.e. torch, via
+# [tool.uv.sources]) may be resolved from it. numpy / matplotlib / pillow
+# still come from the normal (implicit) PyPI.
+explicit = true
