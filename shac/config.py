@@ -167,6 +167,15 @@ class SHACConfig:
     # (state-dependent), but the released implementation uses a single
     # learnable sigma = exp(logstd) initialized to exp(-1) ~= 0.37.
 
+    # --- ablation ------------------------------------------------------------
+    use_critic: bool = True
+    # Ablation switch (--no-critic): when False, the actor loss is ONLY the
+    # discounted short-horizon window reward -- the pure pathwise-derivative
+    # part of paper Eq. 5, without the terminal bootstrap gamma^h * V'(s_h).
+    # No critic/target networks, no td-(lambda), no Polyak step. This turns
+    # SHAC into discounted short-horizon BPTT, isolating what the critic
+    # contributes (long-horizon credit beyond the window; paper Sec. 3.3).
+
     # --- observation normalization ---------------------------------------------
     obs_rms: bool = True
     # Normalize observations with a running mean/std (paper Section 3.3:

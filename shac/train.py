@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--critic-lr", type=float, default=1e-3)
     p.add_argument("--target-alpha", type=float, default=0.2,
                    help="target critic Polyak alpha (paper CartPole: 0.2)")
+    p.add_argument("--no-critic", action="store_true",
+                   help="ablation: train the actor WITHOUT a critic -- the "
+                        "loss keeps only the pathwise-derivative "
+                        "short-horizon window reward of paper Eq. 5 (no "
+                        "terminal bootstrap, no td-(lambda), no target "
+                        "network); i.e. discounted short-horizon BPTT")
 
     # ---- evaluation / logging cadence ------------------------------------
     p.add_argument("--eval-interval", type=int, default=10,
@@ -99,6 +105,7 @@ def main() -> None:
         actor_learning_rate=args.actor_lr,
         critic_learning_rate=args.critic_lr,
         target_critic_alpha=args.target_alpha,
+        use_critic=not args.no_critic,
     )
     run_cfg = RunConfig(
         seed=args.seed,
@@ -131,6 +138,9 @@ def main() -> None:
     print(f"  logdir      : {logdir}")
     print(f"  task        : H = {env_cfg.episode_length} steps, "
           f"reward = -theta^2 - 0.1*thd^2 - 0.05*x^2 - 0.1*xd^2")
+    print(f"  critic      : "
+          f"{'ON (full SHAC)' if algo_cfg.use_critic else 'OFF -- ablation: '
+           'pathwise derivative only'}")
     print()
 
     trainer = SHACTrainer(env_cfg, algo_cfg, run_cfg, device, logger=logger)

@@ -29,6 +29,8 @@ uv sync
 uv run python tests/test_cartpole_dynamics.py
 uv run python tests/test_td_lambda.py
 uv run python tests/test_running_stats.py
+uv run python tests/test_actor_loss.py
+uv run python tests/test_no_critic.py
 
 # train (CPU; ~2-5 minutes for the full 500 episodes on a laptop)
 uv run python -m shac.train --device cpu
@@ -86,8 +88,9 @@ A run with the paper's exact CartPole training budget — the Table 4
 hyperparameters (seed 0, CPU only, `--threads 1`): **500 learning
 episodes × 64 parallel environments × 32-step short-horizon windows =
 1,024,000 environment steps**, the ~10⁶ total spanned by the CartPole
-panel of the paper's Figure 4. On CPU this takes **79 seconds**; the
-best evaluation return is **−291** (at the final episode). The distance
+panel of the paper's Figure 4. On CPU this takes **80 seconds**; the
+best evaluation return is **−300** (episode 430 of 500; the final-episode
+evaluation is −315). The distance
 to 0 is mostly the *swing-up transient itself*: every episode starts
 with the pole hanging (−π), and the energetic swing-up costs a few
 hundred return points before the near-zero-cost balance phase begins.
@@ -96,6 +99,15 @@ hundred return points before the near-zero-cost balance phase begins.
 a TITAN X — 0.15 s forward + 0.23 s backward + 0.34 s critic training —
 so 500 episodes ≈ 6 minutes, exactly the extent of Figure 4's CartPole
 wall-clock axis.)
+
+> **Provenance note.** Every artifact in this section was regenerated
+> after fixing a pre-existing broadcasting bug in the actor loss's
+> per-env reset (found during the ablation work; see the bug note in
+> [ABLATION.md](ABLATION.md)). The bug was a silent constant ×64 on the
+> actor loss in this task, so the fix left the baseline statistically
+> unchanged: seed 0's best evaluation moved from −291 to −300, and a
+> 5-seed rerun of the same configuration gives −325 ± 22
+> ([ABLATION.md](ABLATION.md), arm A).
 
 **Training progression** (return vs simulation steps (×10⁵) and vs
 wall-clock time — the two axes of the paper's Figure 4 — plus losses and
@@ -111,9 +123,31 @@ averaging; `--smooth 0` shows the raw per-episode values):
 
 ![Learned swing-up and balance policy](figures/cartpole_500ep_rollout.gif)
 
+**Episode traces** (the same deterministic episode: pole angle from hanging
+(±180°) to upright within the first ~40 steps, cart position, and per-step
+reward — the pole is lost only in the episode's final steps, consistent
+with the −340 return):
+
+![Episode traces: pole angle, cart position, per-step reward](figures/cartpole_500ep_traces.png)
+
 Training 6× longer (`--episodes 3000`, 6.1M steps, ~8 min on this CPU)
-tightens the best evaluation return to −243 and centers the cart about
-twice as well while balancing.
+tightens the best evaluation return to **−236** (episode 2130 of 3000) —
+the policy keeps improving well past the paper's 500-episode budget.
+
+---
+
+## Ablation: SHAC without a critic
+
+What does the critic actually buy? [ABLATION.md](ABLATION.md) retrains
+this exact baseline **without the critic** — keeping only the
+pathwise-derivative window reward of paper Eq. 5 — at three horizons
+(h = 32 / 64 / 240), 5 seeds per arm at the same ~1.02M-step budget, and
+measures returns, behavior (swing-up success, time-to-upright, balance
+offset), wall-clock cost, and seed stability. Short version: the
+no-critic actor still swings up (85–100% success) but at h=32 cannot
+balance (wobbles at ~32°); h=64 restores balance but not the baseline's
+swing-up speed; full-episode BPTT at h=240 is unstable (1 of 5 seeds
+dies, 1 diverges). Pass `--no-critic` to try it yourself.
 
 ---
 
@@ -124,6 +158,11 @@ pyproject.toml                   project + dependency declaration for uv
                                   (incl. the CPU/GPU torch switch)
 uv.lock                          exact pinned versions -- commit this
 .python-version                  the interpreter uv uses (3.12)
+ABLATION.md                      the no-critic ablation write-up (4 arms
+                                  x 5 seeds, ~1.02M steps each)
+MATH.md                          every formula implemented, in
+                                  training-loop order (MDP, networks,
+                                  actor/critic objectives, ablation)
 
 shac/
 ├── config.py                    1. all hyperparameters, each annotated with
@@ -158,10 +197,21 @@ tests/                           correctness of everything above
 │                                end-to-end gradient flow
 ├── test_td_lambda.py            the vectorized td-(lambda) recursion == a
 │                                naive literal implementation of paper Eq. 7
-└── test_running_stats.py         running statistics == batch statistics
+├── test_actor_loss.py           ★ the actor loss == a naive per-env scalar
+│                                reference of paper Eq. 5 (done-free and
+│                                multi-reset windows; regression test for
+│                                the per-env reset bugfix)
+├── test_no_critic.py            --no-critic == SHAC with a zeroed target
+│                                critic, bit-for-bit; smoke run +
+│                                checkpoint round-trip
+└── test_running_stats.py        running statistics == batch statistics
 
 scripts/
 ├── plot_training.py             learning curves from log.csv -> PNG
+├── plot_ablation.py             5-seed arm overlay -> ablation_eval.png
+│                                (see ABLATION.md)
+├── policy_metrics.py             behavior of a trained checkpoint: swing-up
+│                                success, time-to-upright, balance offset
 └── render_policy.py             trained policy -> animated GIF + traces
 ```
 
@@ -190,6 +240,11 @@ scripts/
 Every stage cites the paper equation it implements; the module docstring of
 `shac/algorithms/shac.py` lists the details the paper leaves open and how the
 official code (NVlabs/DiffRL) resolves them.
+
+Passing `--no-critic` skips stages 3–5 entirely — the actor loss keeps only
+the Eq. 5 window reward (no terminal bootstrap, no td-(lambda), no target
+network). That ablation, with 5-seed results at three horizons, is written
+up in [ABLATION.md](ABLATION.md).
 
 ---
 
@@ -277,6 +332,9 @@ network; CEM/MPPI only need forward rolls (wrap `step()` in `no_grad`). The
 * **`RuntimeError: Non-finite actor gradient norm`** — the simulation
   diverged (states -> NaN). This should not happen with the default
   config; check that you did not shrink the substeps/remove the tanh.
+  It can also happen *genuinely* in long-horizon no-critic training —
+  the ablation's arm C (h=240) lost 1 of 5 seeds to it (see
+  [ABLATION.md](ABLATION.md)).
 * **Learning stalls around -2400** — the critic needs a few episodes to
   warm up (the paper observes the same "slow start vs. PPO"); watch
   `eval_return_mean` around episode 30-100.

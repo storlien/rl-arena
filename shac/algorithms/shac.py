@@ -23,6 +23,11 @@ simulator into accurate policy gradients. Each learning episode:
      arises automatically because the target critic is applied to the
      graph-connected terminal state). One Adam step updates the policy.
 
+     ABLATION (--no-critic): the terminal bootstrap term gamma^h * V' is
+     dropped, leaving ONLY the discounted short-horizon reward -- the pure
+     pathwise-derivative part of Eq. 5 -- and the critic stages 3-4 are
+     skipped entirely (discounted short-horizon BPTT).
+
   3. CRITIC UPDATE (paper Eq. 6-7): estimate a target value for every state
      visited in the window with td-(lambda) (exponentially-weighted mixtures
      of k-step returns, Eq. 7), then fit V by regression (16 iterations over
@@ -169,25 +174,34 @@ class SHACTrainer:
         self.H = self.env.episode_length         # task horizon
 
         # ---- actor and critics ----
+        self.use_critic = self.cfg.use_critic
         self.actor = GaussianActor(self.num_obs, self.num_actions,
                                    self.cfg.actor_units,
                                    self.cfg.actor_logstd_init).to(device)
-        self.critic = Critic(self.num_obs, self.cfg.critic_units).to(device)
-        # Target value network V' (paper Algorithm 1). Its PARAMETERS are
-        # frozen (updated only by Polyak averaging), which means gradients
-        # still flow through its INPUT (d V'/d s, needed for the terminal
-        # adjoint, paper Eq. 9) but never update its weights.
-        self.target_critic = copy.deepcopy(self.critic)
-        for p in self.target_critic.parameters():
-            p.requires_grad_(False)
+        if self.use_critic:
+            self.critic = Critic(self.num_obs, self.cfg.critic_units).to(device)
+            # Target value network V' (paper Algorithm 1). Its PARAMETERS are
+            # frozen (updated only by Polyak averaging), which means gradients
+            # still flow through its INPUT (d V'/d s, needed for the terminal
+            # adjoint, paper Eq. 9) but never update its weights.
+            self.target_critic = copy.deepcopy(self.critic)
+            for p in self.target_critic.parameters():
+                p.requires_grad_(False)
+        else:
+            # Ablation (--no-critic): no critic, no td-(lambda), no Polyak.
+            # The actor loss below omits the gamma^h * V'(s_h) bootstrap term,
+            # leaving only the pathwise-derivative window reward of Eq. 5.
+            self.critic = None
+            self.target_critic = None
 
         # ---- optimizers (Adam with the paper's betas, per-network lrs) ----
         self.actor_opt = torch.optim.Adam(self.actor.parameters(),
                                           lr=self.cfg.actor_learning_rate,
                                           betas=self.cfg.adam_betas)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(),
-                                           lr=self.cfg.critic_learning_rate,
-                                           betas=self.cfg.adam_betas)
+        self.critic_opt = (torch.optim.Adam(self.critic.parameters(),
+                                            lr=self.cfg.critic_learning_rate,
+                                            betas=self.cfg.adam_betas)
+                           if self.use_critic else None)
 
         # ---- observation normalization (running mean/std) ----
         self.obs_rms = (RunningMeanStd((self.num_obs,), device=device)
@@ -209,6 +223,9 @@ class SHACTrainer:
 
         # ---- diagnostics ----
         self.total_env_steps = 0
+        # Task-episode returns completed since the last log row. Filled by
+        # _rollout_and_update_actor; train() clears it after every row.
+        self._completed_returns: List[float] = []
 
     # ======================================================================
     # Learning-rate schedule (official: linear decay toward `lr_final`)
@@ -223,8 +240,9 @@ class SHACTrainer:
         a, c = self._lrs(episode)
         for g in self.actor_opt.param_groups:
             g["lr"] = a
-        for g in self.critic_opt.param_groups:
-            g["lr"] = c
+        if self.critic_opt is not None:
+            for g in self.critic_opt.param_groups:
+                g["lr"] = c
         return a, c
 
     # ======================================================================
@@ -260,8 +278,9 @@ class SHACTrainer:
 
         for i in range(h):
             # ---- collect the state for critic training (constant) ----
-            with torch.no_grad():
-                self.obs_buf[i] = obs.clone()
+            if self.use_critic:
+                with torch.no_grad():
+                    self.obs_buf[i] = obs.clone()
 
             # ---- action: reparameterized Gaussian sample, tanh-squashed ----
             action = torch.tanh(self.actor(obs))
@@ -278,18 +297,26 @@ class SHACTrainer:
 
             # ---- terminal value V'(s_{t+1}) for every env ----
             # Default: target critic on the (post-reset) next observation.
-            nv = self.target_critic(obs).squeeze(-1)
-            if bool(done.any()):
-                # For envs that just finished an episode, replace the value:
-                #   * early termination -> 0   (the episode is a dead end)
-                #   * time limit        -> V'(pre-reset state): the task
-                #     would continue, so we bootstrap the state it died on.
-                pre_reset = norm(info["obs_before_reset"])
-                nv_limit = self.target_critic(pre_reset).squeeze(-1)
-                at_limit = self.episode_steps >= self.H
-                nv_term = torch.where(at_limit, nv_limit,
-                                      torch.zeros_like(nv_limit))
-                nv = torch.where(done, nv_term, nv)
+            # Ablation (--no-critic): nv is identically zero, so every
+            # bootstrap term below vanishes and Eq. 5 degenerates to the
+            # pure pathwise-derivative window reward.
+            if self.use_critic:
+                nv = self.target_critic(obs).squeeze(-1)
+                if bool(done.any()):
+                    # For envs that just finished an episode, replace the
+                    # value:
+                    #   * early termination -> 0   (the episode is a dead end)
+                    #   * time limit        -> V'(pre-reset state): the task
+                    #     would continue, so we bootstrap the state it died
+                    #     on.
+                    pre_reset = norm(info["obs_before_reset"])
+                    nv_limit = self.target_critic(pre_reset).squeeze(-1)
+                    at_limit = self.episode_steps >= self.H
+                    nv_term = torch.where(at_limit, nv_limit,
+                                          torch.zeros_like(nv_limit))
+                    nv = torch.where(done, nv_term, nv)
+            else:
+                nv = torch.zeros(N, device=self.device)
 
             # ---- accumulate the actor loss (paper Eq. 5, segmented) ----
             # Every step extends the running discounted return of each env's
@@ -312,18 +339,19 @@ class SHACTrainer:
             # Discount power advances; finished envs start fresh segments.
             gamma_pow = gamma_pow * gamma
             gamma_pow = torch.where(done, torch.ones_like(gamma_pow), gamma_pow)
-            rew_acc = torch.where(done.unsqueeze(-1),
-                                  torch.zeros_like(rew_acc), rew_acc)
+            rew_acc = torch.where(done, torch.zeros_like(rew_acc), rew_acc)
 
-            # ---- store constants for the critic stage ----
-            with torch.no_grad():
-                self.rew_buf[i] = rew
-                self.next_value_buf[i] = nv.detach()
-                # The window's last step is a bootstrap boundary for every
-                # env (its "terminal value" is V'(s_h)); official: done_mask
-                # is forced to 1 on the final step.
-                self.done_mask[i] = (done.float() if i < h - 1
-                                    else torch.ones_like(done.float()))
+            # ---- store constants for the critic stage (nothing to store
+            #      in the no-critic ablation -- stage 3 does not exist) ----
+            if self.use_critic:
+                with torch.no_grad():
+                    self.rew_buf[i] = rew
+                    self.next_value_buf[i] = nv.detach()
+                    # The window's last step is a bootstrap boundary for
+                    # every env (its "terminal value" is V'(s_h));
+                    # official: done_mask is forced to 1 on the final step.
+                    self.done_mask[i] = (done.float() if i < h - 1
+                                         else torch.ones_like(done.float()))
 
             # ---- per-episode return logging (undiscounted, raw reward) ----
             with torch.no_grad():
@@ -411,15 +439,19 @@ class SHACTrainer:
     # Main training loop
     # ======================================================================
     def train(self) -> Dict[str, float]:
-        self._completed_returns: List[float] = []
         best_eval = -float("inf")
 
         for episode in range(1, self.cfg.num_episodes + 1):
             lr_actor, lr_critic = self._set_lrs(episode - 1)
 
             stats = self._rollout_and_update_actor()     # stages 1-2
-            stats["critic_loss"] = self._update_critic()  # stage 3
-            self._update_target_critic()                  # stage 4
+            if self.use_critic:
+                stats["critic_loss"] = self._update_critic()   # stage 3
+                self._update_target_critic()                   # stage 4
+            else:
+                # Ablation (--no-critic): no critic stages; log an empty
+                # cell so the CSV schema is identical across arms.
+                stats["critic_loss"] = None
 
             # ---- periodic evaluation on a separate env (deterministic) ----
             eval_mean = eval_std = None
@@ -500,10 +532,12 @@ class SHACTrainer:
         path = f"{self.logger.logdir}/{suffix}.pt"
         torch.save({
             "actor": self.actor.state_dict(),
-            "critic": self.critic.state_dict(),
-            "target_critic": self.target_critic.state_dict(),
+            "critic": (self.critic.state_dict() if self.use_critic else None),
+            "target_critic": (self.target_critic.state_dict()
+                              if self.use_critic else None),
             "actor_opt": self.actor_opt.state_dict(),
-            "critic_opt": self.critic_opt.state_dict(),
+            "critic_opt": (self.critic_opt.state_dict()
+                           if self.use_critic else None),
             "obs_rms": (self.obs_rms.state_dict()
                         if self.obs_rms is not None else None),
             "env_cfg": self.env_cfg.__dict__,
@@ -514,21 +548,26 @@ class SHACTrainer:
     def load(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(ckpt["actor"])
-        self.critic.load_state_dict(ckpt["critic"])
-        self.target_critic.load_state_dict(ckpt["target_critic"])
         self.actor_opt.load_state_dict(ckpt["actor_opt"])
-        self.critic_opt.load_state_dict(ckpt["critic_opt"])
         if self.obs_rms is not None and ckpt["obs_rms"] is not None:
             self.obs_rms.load_state_dict(ckpt["obs_rms"])
+        # The critic keys are None in --no-critic checkpoints; restore them
+        # only when both this trainer and the checkpoint have a critic.
+        if self.use_critic and ckpt.get("critic") is not None:
+            self.critic.load_state_dict(ckpt["critic"])
+            self.target_critic.load_state_dict(ckpt["target_critic"])
+            self.critic_opt.load_state_dict(ckpt["critic_opt"])
 
     # ======================================================================
     # Console output
     # ======================================================================
     def _print_row(self, row: Dict[str, float]) -> None:
+        cl = (f"{row['critic_loss']:8.4f}" if row["critic_loss"] is not None
+              else "     n/a")
         msg = (f"ep {row['episode']:4d}/{self.cfg.num_episodes} "
                f"| steps {row['env_steps']:7d} "
                f"| actor_loss {row['actor_loss']:9.2f} "
-               f"| critic_loss {row['critic_loss']:8.4f} "
+               f"| critic_loss {cl} "
                f"| std {row['policy_std']:.3f} "
                f"| lr {row['lr_actor']:.2e}")
         if row["train_return_mean"] is not None:
