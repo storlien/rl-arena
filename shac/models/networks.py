@@ -36,6 +36,8 @@ the applied force; gradients flow through tanh.
 
 from typing import Tuple
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -44,6 +46,44 @@ import torch.nn as nn
 # "Soft Actor-Critic" clamps log_std to [-20, 2]).
 LOG_STD_MIN = -20.0
 LOG_STD_MAX = 2.0
+
+# Guard for log(1 - tanh^2(u)): the squashed-Gaussian entropy diverges as
+# the sampled action saturates toward +/-1 (SAC adds the same epsilon).
+TANH_ENTROPY_EPS = 1e-6
+
+
+def tanh_gaussian_entropy(u: torch.Tensor,
+                          sigma: torch.Tensor) -> torch.Tensor:
+    """Per-dim entropy of the squashed Gaussian a = tanh(u),
+    u ~ N(mu, sigma^2), estimated at the SAMPLED u (SAC's estimator).
+
+    Change of variables a = tanh(u) gives
+    log pi(a|s) = log N(u|mu,sigma) - log(1 - tanh^2(u)), so
+
+        H[a|s] = E[-log pi] = log sigma + 0.5*log(2*pi*e)
+                             + E[log(1 - tanh^2(u))]
+
+    The tanh term is <= 0: SQUASHING REDUCES entropy (an action driven
+    into saturation is nearly deterministic, hence low-entropy), and its
+    gradient pushes mu back from the boundary. The expectation is
+    approximated by its value at the reparameterized sample (the E[eps^2]
+    part of the exact -log pi is replaced by its mean 1: it has zero mean
+    and zero theta-gradient in expectation, so this estimator is
+    unbiased with LOWER variance than SAC's per-sample -log pi).
+    Differentiable in mu (the tanh correction) and in sigma (log sigma)
+    -- both inside the SHAC window's computation graph, so the entropy
+    term trains the policy through the same FOBG path as the reward
+    (SAPO Eq. 18-19).
+
+    Args:
+      u:     [batch, action_dim]  the SAMPLED pre-tanh actions.
+      sigma: [batch, action_dim]   policy std at the same states.
+    Returns:
+      [batch, action_dim] per-dimension entropies.
+    """
+    gauss = torch.log(sigma) + 0.5 * math.log(2.0 * math.pi * math.e)
+    correction = torch.log(1.0 - torch.tanh(u) ** 2 + TANH_ENTROPY_EPS)
+    return gauss + correction
 
 
 # ---------------------------------------------------------------------------
@@ -128,10 +168,14 @@ class GaussianActor(nn.Module):
         sigma = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX).exp()
         return mu, sigma
 
-    def forward(self, obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+    def _sample_core(self, obs: torch.Tensor) -> Tuple[torch.Tensor,
+                                                        torch.Tensor,
+                                                        torch.Tensor]:
+        """The single reparameterized-sampling path shared by forward()
+        and sample_with_entropy() (one randn draw, one std-accumulator
+        update in state mode) -- so switching the trainer to the
+        entropy objective does NOT perturb the RNG stream."""
         mu, sigma = self.mu_sigma(obs)
-        if deterministic:
-            return mu
         # Reparameterization: the noise is external to the parameters, so
         # d(sample)/d(theta) = d(mu)/d(theta) + epsilon * d(sigma)/d(theta).
         eps = torch.randn_like(mu)
@@ -142,7 +186,25 @@ class GaussianActor(nn.Module):
             with torch.no_grad():
                 self._std_acc += float(sigma.mean())
                 self._std_n += 1
-        return mu + sigma * eps
+        return mu + sigma * eps, mu, sigma
+
+    def forward(self, obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        if deterministic:
+            return self.mu_sigma(obs)[0]
+        return self._sample_core(obs)[0]
+
+    def sample_with_entropy(self, obs: torch.Tensor) -> Tuple[torch.Tensor,
+                                                               torch.Tensor]:
+        """Reparameterized sample PLUS its per-dim tanh-Gaussian entropy.
+
+        Returns (u, h): the pre-tanh action u ~ N(mu(s), sigma(s)) and
+        h = the squashed-Gaussian entropy estimate at that sample
+        (see tanh_gaussian_entropy). Used by the max-entropy trainer
+        (SHACConfig.max_entropy) to add SAPO's alpha * entropy term to
+        the window return; identical RNG consumption to forward().
+        """
+        u, _, sigma = self._sample_core(obs)
+        return u, tanh_gaussian_entropy(u, sigma)
 
     def reset_std(self) -> None:
         """Start a fresh policy_std accumulation window (state mode)."""

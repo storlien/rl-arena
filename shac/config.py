@@ -181,6 +181,31 @@ class SHACConfig:
     # of sigma(s). Checkpoints from the two modes are NOT
     # architecture-compatible (load with the same --state-std).
 
+    # --- maximum entropy objective (SAC-style; cf. MAX_ENTROPY.md) -------
+    max_entropy: bool = False
+    # The SAPO arm (Xing et al., ICLR 2025): augment the actor's window
+    # return with alpha * entropy (their Eq. 18-19) and the critic's
+    # td-(lambda) targets with the same term (soft values, Eq. 20), with
+    # the temperature alpha auto-tuned by SAC's dual (Eq. 21) to hold the
+    # policy entropy near entropy_target. This adds the entropy
+    # counter-pressure whose ABSENCE collapsed sigma(s) in the state-std
+    # A/B (STATE_STD.md). Works with BOTH sigma parameterizations; the
+    # architecture is unchanged, so checkpoints load across this flag.
+
+    entropy_target: Optional[float] = None
+    # Target policy entropy H-bar for the alpha dual. None -> -dim(A)/2
+    # (SAC convention via Ball et al. 2023, also SAPO's choice);
+    # -0.5 for CartPole's 1-D action.
+
+    entropy_lr: float = 5e-3
+    # Dual-step learning rate for alpha (SAPO's "entropy eta").
+
+    entropy_init_alpha: float = 1.0
+    # Initial temperature (SAPO Table 4). alpha >= 0 always (clamped).
+    # NOTE: like SAPO, the entropy is normalized to ~[0, 1] by H-bar
+    # before entering the actor loss and the critic targets
+    # (their design choice II); the dual step uses the RAW entropy.
+
     # --- ablation ------------------------------------------------------------
     use_critic: bool = True
     # Ablation switch (--no-critic): when False, the actor loss is ONLY the

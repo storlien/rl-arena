@@ -72,6 +72,25 @@ def parse_args() -> argparse.Namespace:
                         "[-20, 2] as in SAC, instead of the official global "
                         "learnable sigma. Zero-init head: both variants start "
                         "from the same sigma = exp(logstd_init)")
+    p.add_argument("--max-entropy", action="store_true",
+                   help="experimental arm: SAC/SAPO-style MAXIMUM-ENTROPY "
+                        "objective -- augment the actor's window return and "
+                        "the critic's td-(lambda) targets with "
+                        "alpha * entropy (SAPO Eq. 18-20), alpha auto-tuned "
+                        "by SAC's dual (Eq. 21) toward the target entropy. "
+                        "Adds the entropy counter-pressure whose absence "
+                        "collapsed sigma in the --state-std A/B "
+                        "(STATE_STD.md). Works with BOTH sigma "
+                        "parameterizations; logs entropy_alpha / "
+                        "policy_entropy; checkpoints load across the flag")
+    p.add_argument("--entropy-target", type=float, default=None,
+                   help="target entropy H-bar for the alpha dual "
+                        "(default: -dim(A)/2, SAC/SAPO convention; -0.5 for "
+                        "CartPole's 1-D action)")
+    p.add_argument("--entropy-lr", type=float, default=5e-3,
+                   help="dual-step learning rate for alpha")
+    p.add_argument("--entropy-init-alpha", type=float, default=1.0,
+                   help="initial temperature alpha (SAPO Table 4)")
 
     # ---- evaluation / logging cadence ------------------------------------
     p.add_argument("--eval-interval", type=int, default=10,
@@ -123,6 +142,10 @@ def main() -> None:
         target_critic_alpha=args.target_alpha,
         use_critic=not args.no_critic,
         actor_state_std=args.state_std,
+        max_entropy=args.max_entropy,
+        entropy_target=args.entropy_target,
+        entropy_lr=args.entropy_lr,
+        entropy_init_alpha=args.entropy_init_alpha,
     )
     run_cfg = RunConfig(
         seed=args.seed,
@@ -160,6 +183,12 @@ def main() -> None:
     print(f"  critic      : "
           f"{'ON (full SHAC)' if algo_cfg.use_critic else 'OFF -- ablation: '
            'pathwise derivative only'}")
+    if algo_cfg.max_entropy:
+        print(f"  max-entropy : ON -- soft window return + soft td-(lambda) "
+              f"targets, dual-tuned alpha (target H = "
+              f"{-0.5 if algo_cfg.entropy_target is None else algo_cfg.entropy_target:+.2f}"
+              f" [-dim(A)/2 default, CartPole dim(A)=1], "
+              f"init alpha = {algo_cfg.entropy_init_alpha:g})")
     print()
 
     trainer = SHACTrainer(env_cfg, algo_cfg, run_cfg, device, logger=logger)

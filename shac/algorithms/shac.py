@@ -223,6 +223,29 @@ class SHACTrainer:
                                          device=device)
         self.episode_return = torch.zeros(self.num_envs, device=device)
 
+        # ---- maximum-entropy objective (SHACConfig.max_entropy) ----
+        # SAC's temperature alpha, tuned by the dual step (SAPO Eq. 21);
+        # H-bar normalizes the entropy that enters the losses (their
+        # design choice II), while the dual sees the RAW entropy.
+        self.max_entropy = self.cfg.max_entropy
+        self.entropy_target = (self.cfg.entropy_target
+                               if self.cfg.entropy_target is not None
+                               else -0.5 * self.num_actions)
+        self.entropy_alpha = float(self.cfg.entropy_init_alpha)
+        self._ent_norm_den = 2.0 * abs(self.entropy_target) or 1.0
+        # Per-window bookkeeping (filled by _run_window):
+        #   ent_buf[i]  the NORMALIZED per-step entropy hat{h}_t
+        #               (alpha * ent_buf enters the critic's soft targets)
+        #   _window_ent_mean  mean RAW entropy over the window (logging)
+        #   _window_ent_dual  mean (h_raw - H-bar) over the window (dual)
+        #   _window_ent_contrib  the entropy part's exact contribution to
+        #               the returned actor loss (verification/tests)
+        if self.max_entropy:
+            self.ent_buf = torch.zeros(*shape, device=device)
+        self._window_ent_mean = 0.0
+        self._window_ent_dual = 0.0
+        self._window_ent_contrib = 0.0
+
         # ---- diagnostics ----
         self.total_env_steps = 0
         # Task-episode returns completed since the last log row. Filled by
@@ -280,9 +303,17 @@ class SHACTrainer:
         #                gamma^{t-a} * r_t   (a = segment start)
         # gamma_pow[e] = gamma^{steps since segment start}; reset to 1 when
         #                the env finishes an episode (official handling)
+        # ent_acc[e]   = same segmentation for the ENTROPY part of the
+        #                max-entropy return (SAPO Eq. 18): the entropy term
+        #                is a per-step scalar exactly like the reward, so
+        #                it accumulates with the identical gamma/done logic
+        #                and both are drained into the loss together.
         rew_acc = torch.zeros(N, device=self.device)
+        ent_acc = torch.zeros(N, device=self.device)
         gamma_pow = torch.ones(N, device=self.device)
         actor_loss = torch.zeros((), device=self.device)
+        ent_raw_sum = 0.0        # detached sum of per-step mean raw h
+        self._window_ent_contrib = 0.0   # this window's entropy part (tests)
 
         # Fresh policy_std accumulation window (state-std mode): the
         # diagnostics' sigma-mean below then covers exactly this window's
@@ -302,7 +333,22 @@ class SHACTrainer:
                     self.obs_buf[i] = obs.clone()
 
             # ---- action: reparameterized Gaussian sample, tanh-squashed ----
-            action = torch.tanh(self.actor(obs))
+            if self.max_entropy:
+                # SAPO Eq. 18: the window return additionally carries
+                # alpha * hat{h}_t per step. hat{h} is the H-bar-normalized
+                # entropy (their design choice II -- approximately [0, 1],
+                # robust across reward scales); the alpha dual below sees
+                # the RAW h. sample_with_entropy consumes the RNG exactly
+                # like forward(), so the rollout stream is unchanged.
+                u_sample, ent_dim = self.actor.sample_with_entropy(obs)
+                action = torch.tanh(u_sample)
+                ent_raw = ent_dim.sum(dim=-1)                     # [N]
+                ent_hat = ((ent_raw + abs(self.entropy_target))
+                           / self._ent_norm_den)                  # [N]
+                with torch.no_grad():
+                    ent_raw_sum += float(ent_raw.mean())
+            else:
+                action = torch.tanh(self.actor(obs))
 
             # ---- differentiable simulator step ----
             obs_raw, rew, done, info = self.env.step(action)
@@ -337,34 +383,55 @@ class SHACTrainer:
             else:
                 nv = torch.zeros(N, device=self.device)
 
-            # ---- accumulate the actor loss (paper Eq. 5, segmented) ----
+            # ---- accumulate the actor loss (paper Eq. 5, segmented; with
+            #      --max-entropy the segment return additionally carries
+            #      the entropy part, SAPO Eq. 18-19) ----
             # Every step extends the running discounted return of each env's
             # current segment ...
             rew_acc = rew_acc + gamma_pow * rew
+            if self.max_entropy:
+                ent_acc = ent_acc + gamma_pow * self.entropy_alpha * ent_hat
+            seg_acc = rew_acc + ent_acc if self.max_entropy else rew_acc
             if i < h - 1:
                 # ... and envs that finish an episode contribute their full
                 # segment return + terminal value NOW:
                 if bool(done.any()):
                     actor_loss = actor_loss - (
-                        rew_acc[done_ids]
+                        seg_acc[done_ids]
                         + gamma * gamma_pow[done_ids] * nv[done_ids]).sum()
+                    if self.max_entropy:
+                        with torch.no_grad():
+                            self._window_ent_contrib += float(
+                                ent_acc[done_ids].sum())
             else:
                 # at the window end, ALL envs contribute their remaining
                 # segment:  sum_t gamma^{t-a} r_t + gamma^{h-a} V'(s_h)
                 # (with a=0 this is exactly paper Eq. 5).
-                actor_loss = actor_loss - (rew_acc
+                actor_loss = actor_loss - (seg_acc
                                            + gamma * gamma_pow * nv).sum()
+                if self.max_entropy:
+                    with torch.no_grad():
+                        self._window_ent_contrib += float(ent_acc.sum())
 
             # Discount power advances; finished envs start fresh segments.
             gamma_pow = gamma_pow * gamma
             gamma_pow = torch.where(done, torch.ones_like(gamma_pow), gamma_pow)
             rew_acc = torch.where(done, torch.zeros_like(rew_acc), rew_acc)
+            if self.max_entropy:
+                ent_acc = torch.where(done, torch.zeros_like(ent_acc),
+                                      ent_acc)
 
             # ---- store constants for the critic stage (nothing to store
             #      in the no-critic ablation -- stage 3 does not exist) ----
             if self.use_critic:
                 with torch.no_grad():
                     self.rew_buf[i] = rew
+                    if self.max_entropy:
+                        # The critic fits SOFT values: its td-(lambda)
+                        # targets use r + alpha * hat{h} (SAPO Eq. 20) --
+                        # hat{h} here, alpha applied at target time (the
+                        # post-dual alpha, per their pseudocode).
+                        self.ent_buf[i] = ent_hat.detach()
                     self.next_value_buf[i] = nv.detach()
                     # The window's last step is a bootstrap boundary for
                     # every env (its "terminal value" is V'(s_h));
@@ -380,6 +447,12 @@ class SHACTrainer:
                         self.episode_return[done_ids].tolist())
                     self.episode_return[done_ids] = 0.0
                     self.episode_steps[done_ids] = 0
+
+        # Per-window raw-entropy stats: logging (policy_entropy) and the
+        # alpha dual (mean(h - H-bar) over steps and envs).
+        if self.max_entropy:
+            self._window_ent_mean = ent_raw_sum / h
+            self._window_ent_dual = self._window_ent_mean - self.entropy_target
 
         # Eq. 5 normalization by N*h (paper Algorithm 1).
         return actor_loss / (N * h)
@@ -400,11 +473,29 @@ class SHACTrainer:
                 "simulation probably diverged -- check action bounds/dt.")
         self.actor_opt.step()
 
+        # ---- the alpha dual (SAC Eq. 21 as instantiated by SAPO) ----
+        # Gradient-ascent on the dual objective J(alpha) = alpha*(H-bar - h)
+        # pushes alpha UP when the window entropy h is BELOW the target
+        # (explore more) and DOWN when it is above. The actor loss above
+        # used the PRE-dual alpha; the critic's soft targets below see the
+        # POST-dual value (SAPO's pseudocode order). Clamped at 0: the
+        # entropy bonus must never become a penalty.
+        alpha_used = self.entropy_alpha
+        if self.max_entropy:
+            self.entropy_alpha = max(
+                0.0, self.entropy_alpha - self.cfg.entropy_lr
+                * self._window_ent_dual)
+
         self.total_env_steps += N * h
         return {
             "actor_loss": float(actor_loss.item()),
             "actor_grad_norm": float(grad_norm.item()),
             "policy_std": self.actor.std(),
+            # alpha that entered THIS episode's actor loss (pre-dual);
+            # None keeps the CSV schema identical when the flag is off.
+            "entropy_alpha": alpha_used if self.max_entropy else None,
+            "policy_entropy": (self._window_ent_mean if self.max_entropy
+                               else None),
         }
 
     # ======================================================================
@@ -473,7 +564,17 @@ class SHACTrainer:
         what clip_grad_norm_ returns, matching actor_grad_norm."""
         # ---- target values V-tilde(s) for every state in the window ----
         with torch.no_grad():
-            targets = td_lambda_values(self.rew_buf, self.next_value_buf,
+            # SOFT values under --max-entropy (SAPO Eq. 20): the td-(lambda)
+            # recursion runs on r + alpha * hat{h} instead of r, with the
+            # POST-dual alpha (the dual step in _rollout_and_update_actor
+            # already ran). The critic then estimates the entropy-
+            # augmented return, matching what the actor's window loss
+            # optimizes.
+            if self.max_entropy:
+                soft_rew = self.rew_buf + self.entropy_alpha * self.ent_buf
+            else:
+                soft_rew = self.rew_buf
+            targets = td_lambda_values(soft_rew, self.next_value_buf,
                                        self.done_mask, self.cfg.gamma,
                                        self.cfg.td_lambda)     # [h, N]
 
@@ -651,6 +752,12 @@ class SHACTrainer:
                         if self.obs_rms is not None else None),
             "env_cfg": self.env_cfg.__dict__,
             "algo_cfg": self.cfg.__dict__,
+            # The dual-tuned temperature (None when the max-entropy
+            # objective is off). Stored separately from algo_cfg so a
+            # non-entropy trainer can load the same checkpoint and simply
+            # ignore it.
+            "entropy_alpha": (float(self.entropy_alpha)
+                              if self.max_entropy else None),
         }, path)
         return path
 
@@ -666,6 +773,12 @@ class SHACTrainer:
             self.critic.load_state_dict(ckpt["critic"])
             self.target_critic.load_state_dict(ckpt["target_critic"])
             self.critic_opt.load_state_dict(ckpt["critic_opt"])
+        # Restore the dual-tuned temperature so a resumed max-entropy run
+        # continues the schedule where it left off (older/other-mode
+        # checkpoints simply have no key, and non-entropy trainers ignore
+        # the field entirely).
+        if (self.max_entropy and ckpt.get("entropy_alpha") is not None):
+            self.entropy_alpha = float(ckpt["entropy_alpha"])
 
     # ======================================================================
     # Console output
@@ -681,6 +794,9 @@ class SHACTrainer:
                f"| lr {row['lr_actor']:.2e}")
         if row["train_return_mean"] is not None:
             msg += f" | train_ret {row['train_return_mean']:8.1f}"
+        if row.get("entropy_alpha") is not None:
+            msg += (f" | a* {row['entropy_alpha']:.3f}"
+                    f" | H {row['policy_entropy']:+.2f}")
         if row["eval_return_mean"] is not None:
             msg += (f" | EVAL ret {row['eval_return_mean']:8.1f}"
                     f" +/- {row['eval_return_std']:.1f}")
