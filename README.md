@@ -33,6 +33,7 @@ uv run python tests/test_actor_loss.py
 uv run python tests/test_no_critic.py
 uv run python tests/test_grad_var.py
 uv run python tests/test_state_std.py
+uv run python tests/test_max_entropy.py
 
 # train (CPU; ~2-5 minutes for the full 500 episodes on a laptop)
 uv run python -m shac.train --device cpu
@@ -205,6 +206,52 @@ cost, and how the result matches SAPO's ablations — is
 
 ---
 
+## Experiment: SAC/SAPO-style max-entropy objective
+
+The state-std A/B's diagnosis was that sigma collapses because SHAC's
+loss has no entropy term — the counter-pressure SAC couples to
+state-dependent sigma. `--max-entropy` adds it the way SAPO (ICLR
+2025) instantiates SAC inside a short-horizon window: the actor's
+segment returns carry `alpha * h_hat` per step, the critic's td-(lambda)
+targets run on `r + alpha * h_hat` (soft values), and alpha is tuned by
+SAC's dual toward a target entropy of `-dim(A)/2 = -0.5` (alpha init
+1.0, clamped at 0; pre-dual alpha in the actor loss, post-dual in the
+critic targets, SAPO's H-bar-normalized entropy in the losses, raw h
+in the dual). Orthogonal to `--state-std`; checkpoints load across the
+flag; the CSV grows `entropy_alpha` / `policy_entropy` (empty when off).
+
+Four arms at the paper budget (500 episodes, seed 0, ~86-90 s each):
+
+| | global σ | state σ(s) | global σ + ent | state σ(s) + ent |
+|---|---|---|---|---|
+| best eval return | **−274.0** | −311.8 | −314.3 | −308.6 |
+| final policy std | 0.058 | 0.0006 | 0.163 | 0.142 |
+| final alpha / entropy h | — | — | 0.243 / −0.46 | 0.228 / −0.58 |
+
+![Max-entropy A/B: both sigma modes, with and without the entropy objective](figures/max_entropy_ab.png)
+
+The mechanism works exactly as SAC's theory says — alpha decays
+1.0 → 0.23 and parks the policy entropy on the −0.5 target, which
+floors sigma at ≈ 0.15 (the h = −0.5 equilibrium) and fully rescues
+the state mode's 0.0006 collapse (→ 0.142). But it does not beat the
+plain global sigma at this budget: the entropy arms' sustained
+exploration is a tax the 1.02M-step budget never collects back, and
+the plain objective finishes 34-40 points clear.
+
+Verdict: at the paper budget on CartPole keep the official objective;
+the negative result bounds SAPO's scope (their gains are on
+contact-rich/deformable tasks where SHAC stalls in local minima)
+rather than contradicting it. Tests: tests/test_max_entropy.py —
+including the Monte-Carlo pin of the tanh-Gaussian entropy estimator
+that caught a real sign error in the change-of-variables correction
+during development. The full write-up — the wiring, the dual's α/H/σ
+trajectories, the budget interpretation, and the SAPO relation — is
+[MAX_ENTROPY.md](MAX_ENTROPY.md). Pass `--max-entropy` (optionally
+`--entropy-target` / `--entropy-lr` / `--entropy-init-alpha`) to try
+it yourself.
+
+---
+
 ## Repository layout (suggested reading order)
 
 ```
@@ -217,6 +264,10 @@ ABLATION.md                      the no-critic ablation write-up (4 arms
 STATE_STD.md                     the state-dependent sigma A/B write-up
                                   (global vs SAC-style sigma(s), the
                                   exploration collapse, SAPO relation)
+MAX_ENTROPY.md                   the max-entropy objective A/B write-up
+                                  (SAC/SAPO-style soft returns + dual-
+                                  tuned alpha, both sigma modes, the
+                                  negative result and SAPO's scope)
 MATH.md                          every formula implemented, in
                                   training-loop order (MDP, networks,
                                   actor/critic objectives, ablation)
@@ -266,6 +317,10 @@ tests/                           correctness of everything above
 ├── test_state_std.py            SAC-style state-dependent sigma(s): init
 │                                equivalence, clamp bounds, gradient
 │                                path, train integration, ckpt round-trip
+├── test_max_entropy.py          SAC/SAPO-style max-entropy objective: MC
+│                                pin of the tanh-Gaussian entropy estimator,
+│                                dual direction/clamp, actor + critic
+│                                wiring, CSV schema, ckpt alpha round-trip
 └── test_running_stats.py        running statistics == batch statistics
 
 scripts/
@@ -274,6 +329,8 @@ scripts/
 │                                (see ABLATION.md)
 ├── plot_std_ab.py               the state-std A/B figure -> state_std_ab.png
 │                                (see STATE_STD.md)
+├── plot_max_entropy.py          the four-arm max-entropy figure ->
+│                                max_entropy_ab.png (see MAX_ENTROPY.md)
 ├── policy_metrics.py             behavior of a trained checkpoint: swing-up
 │                                success, time-to-upright, balance offset
 └── render_policy.py             trained policy -> animated GIF + traces
@@ -330,6 +387,7 @@ up in [ABLATION.md](ABLATION.md).
 | obs normalization | running mean/std, frozen within each episode | paper §3.3 |
 | networks | [64, 64] MLPs, ELU + LayerNorm | paper Table 1 |
 | action | tanh(N(mu, sigma)), learnable log-std init -1 | official code |
+| max-entropy (off by default) | target H = -dim(A)/2, alpha init 1.0, alpha lr 5e-3 | SAC / SAPO (see MAX_ENTROPY.md) |
 
 ---
 
