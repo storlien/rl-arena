@@ -198,8 +198,10 @@ making sigma state-dependent without also adding SAC's max-entropy
 objective removes exploration faster, not better. In this mode
 `policy_std` logs the window-mean of sigma(s); checkpoints of the two
 modes are not architecture-compatible (load with the same `--state-std`
-flag). Tests: tests/test_state_std.py. Pass `--state-std` to try it
-yourself.
+flag). Tests: tests/test_state_std.py. The full write-up — the
+clean-start A/B design, per-state sigma tables, the estimator-variance
+cost, and how the result matches SAPO's ablations — is
+[STATE_STD.md](STATE_STD.md). Pass `--state-std` to try it yourself.
 
 ---
 
@@ -212,6 +214,9 @@ uv.lock                          exact pinned versions -- commit this
 .python-version                  the interpreter uv uses (3.12)
 ABLATION.md                      the no-critic ablation write-up (4 arms
                                   x 5 seeds, ~1.02M steps each)
+STATE_STD.md                     the state-dependent sigma A/B write-up
+                                  (global vs SAC-style sigma(s), the
+                                  exploration collapse, SAPO relation)
 MATH.md                          every formula implemented, in
                                   training-loop order (MDP, networks,
                                   actor/critic objectives, ablation)
@@ -267,6 +272,8 @@ scripts/
 ├── plot_training.py             learning curves from log.csv -> PNG
 ├── plot_ablation.py             5-seed arm overlay -> ablation_eval.png
 │                                (see ABLATION.md)
+├── plot_std_ab.py               the state-std A/B figure -> state_std_ab.png
+│                                (see STATE_STD.md)
 ├── policy_metrics.py             behavior of a trained checkpoint: swing-up
 │                                success, time-to-upright, balance offset
 └── render_policy.py             trained policy -> animated GIF + traces
