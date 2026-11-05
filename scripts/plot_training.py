@@ -6,11 +6,22 @@ Usage:
     uv run python scripts/plot_training.py runs/cartpole_20260103_120000 -o my_plot.png
     uv run python scripts/plot_training.py runs/cartpole_20260103_120000 --smooth 0   # raw
 
-Produces a 2x2 figure, with the paper's Figure 4 axes:
+Produces a 2x2 figure plus one full-width bottom panel, with the paper's
+Figure 4 axes:
   (1) episode return vs simulation steps (x10^5)  (train + eval curves)
   (2) episode return vs wall-clock time            (the paper's other axis)
   (3) actor / critic losses        (also vs simulation steps)
-  (4) diagnostics: policy std, gradient norms
+  (4) diagnostics: policy std, actor & critic gradient norms
+  (5) actor gradient ESTIMATOR (bottom, full width): the variance and
+      mean norm of the actor gradient sampled over k frozen-policy
+      windows per point (actor_grad_var / actor_grad_mean_norm, logged
+      every --grad-var-interval episodes). This is the variance quantity
+      behind the paper's short-horizon motivation (Sec. 3.2), measured
+      LIVE along training: each point holds the policy fixed and resamples
+      the window randomness k times, which separates estimator noise from
+      the drift of the true gradient as the policy learns (one logged
+      gradient per episode cannot do that). Runs trained with
+      --grad-var-interval 0 simply omit these series.
 
 ABOUT SMOOTHING: every series is one point per learning episode from a single
 seed, which is much noisier than the paper's Figure 4, where each curve is a
@@ -36,6 +47,7 @@ progresses); both views carry the same information.
 
 import argparse
 import csv
+import json
 import os
 import statistics
 import sys
@@ -137,11 +149,16 @@ def main():
     steps_1e5 = [s / 1e5 for s in steps]
     wall_min = [w / 60.0 for w in wall]
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8.5))
+    fig = plt.figure(figsize=(13, 11))
+    gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 0.85])
+    # rows 0-1 mirror the previous 2x2 layout; the third row is a single
+    # full-width axis for the gradient-estimator panel.
+    axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]),
+            fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])]
     fig.suptitle("SHAC on CartPole Swing-Up", fontsize=14)
 
     # ---------------- (1) return vs simulation steps ----------------
-    ax = axes[0, 0]
+    ax = axes[0]
     tr_m, tr_s = col(rows, "train_return_mean"), col(rows, "train_return_std")
     ev_m, ev_s = col(rows, "eval_return_mean"), col(rows, "eval_return_std")
     tr_ms, tr_ss = smooth(tr_m, window), smooth(tr_s, window)
@@ -173,18 +190,21 @@ def main():
     # ---------------- (2) return vs wall-clock time ----------------
     # The paper's Figure 4 bottom row: the same learning curve against
     # wall-clock training time instead of samples.
-    ax = axes[0, 1]
+    ax = axes[1]
     wx, wm = masked(wall_min, ev_ms)
     if wm:
         ax.plot(wx, wm, color="C1", lw=2)
     ax.axhline(-2369, color="gray", ls=":")
+    # The eval curve stays far above the -2369 reference, so autoscale
+    # would leave it flush with the frame; add breathing room below it.
+    ax.margins(y=0.12)
     ax.set_xlabel("wall-clock time (min)")
     ax.set_ylabel("eval episode return")
     ax.set_title("Return vs wall-clock time (cf. paper Fig. 4 bottom)")
     ax.grid(alpha=0.3)
 
     # ---------------- (3) losses ----------------
-    ax = axes[1, 0]
+    ax = axes[2]
     al = col(rows, "actor_loss")
     cl = col(rows, "critic_loss")
     ax.plot(steps_1e5, smooth(al, w_loss, stat="median"), color="C2", lw=1.5,
@@ -202,9 +222,10 @@ def main():
     ax.grid(alpha=0.3)
 
     # ---------------- (4) diagnostics ----------------
-    ax = axes[1, 1]
+    ax = axes[3]
     sd = col(rows, "policy_std")
     gn = col(rows, "actor_grad_norm")
+    cg = col(rows, "critic_grad_norm")
     ax.plot(steps_1e5, smooth(sd, w_loss), color="C4", lw=1.5,
             label="policy std")
     ax.set_xlabel("simulation steps ($\\times 10^5$)")
@@ -212,10 +233,70 @@ def main():
     ax2 = ax.twinx()
     ax2.plot(steps_1e5, smooth(gn, w_loss, stat="median"), color="C5", lw=1.5,
              alpha=0.8, label="actor grad norm")
+    # critic_grad_norm: mean pre-clip norm over the 64 critic minibatch
+    # steps of the episode (None in --no-critic runs and in logs from
+    # before the column existed).
+    if any(v is not None for v in cg):
+        ax2.plot(steps_1e5, smooth(cg, w_loss, stat="median"), color="C6",
+                 lw=1.2, alpha=0.8, label="critic grad norm (mean/episode)")
     ax2.set_yscale("log")
-    ax2.set_ylabel("actor grad norm (log)", color="C5")
+    ax2.set_ylabel("gradient norms (log)")
     ax.set_title("Diagnostics")
     ax.grid(alpha=0.3)
+    # The legend must cover BOTH axes' artists: policy std lives on the
+    # left axis, the gradient norms on the right one.
+    h_std, l_std = ax.get_legend_handles_labels()
+    h_grad, l_grad = ax2.get_legend_handles_labels()
+    ax2.legend(h_std + h_grad, l_std + l_grad, fontsize=8, loc="upper right")
+
+    # ---------------- (5) gradient estimator (full width) ----------------
+    # actor_grad_var / actor_grad_mean_norm are SPARSE columns (one value
+    # per --grad-var-interval episodes), like the eval columns.
+    ax = fig.add_subplot(gs[2, :])
+    gvar = col(rows, "actor_grad_var")
+    gmean = col(rows, "actor_grad_mean_norm")
+    if any(v is not None for v in gvar):
+        # state k in the legend when the run's metadata records it
+        k_txt = "k windows/point"
+        try:
+            with open(os.path.join(args.logdir, "metadata.json")) as f:
+                kv = int(json.load(f)["run"]["grad_var_samples"])
+            if kv > 0:
+                k_txt = f"k={kv} windows/point"
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        # window in ROW units; the median ignores reset-spike windows
+        # (cf. smooth()): a measured window can land on the lockstep
+        # task resets, just like a training window can.
+        vs_x, vs_y = masked(steps_1e5, smooth(gvar, w_eval, stat="median"))
+        ms_x, ms_y = masked(steps_1e5, smooth(gmean, w_eval, stat="median"))
+        ax.plot(vs_x, vs_y, color="C7", lw=1.8, marker="o", ms=3,
+                label=r"$\hat{v} = \mathrm{E}[\|g\|^2] - \|\mathrm{E}[g]\|^2$"
+                      f"  (estimator variance, {k_txt})")
+        ax.plot(ms_x, ms_y, color="C8", lw=1.5, ls="--", marker="s", ms=3,
+                label=r"$\|\mathrm{E}[g]\|$  (mean grad norm, same windows)")
+        ax.set_yscale("log")
+        ax.set_ylabel("actor gradient (log)")
+        ax.grid(alpha=0.3)
+        # "upper left" is verified collision-free against the variance
+        # staircase (the curve only rises to the panel's top on the right
+        # side); matplotlib's default "best" parks the legend mid-right,
+        # where the rising segment passes behind it.
+        ax.legend(fontsize=9, loc="upper left")
+        # The vertical gap between the two curves is the signal-to-noise
+        # separation: ||E[g]||^2 above v-hat means the window's gradient
+        # is signal-dominated (see the scripts header note).
+    else:
+        ax.text(0.5, 0.5,
+                "no actor_grad_var column in this log -- run training with "
+                "--grad-var-interval > 0 to measure the gradient estimator",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=10, color="gray")
+        ax.set_xticks([])
+        ax.set_yticks([])
+    ax.set_xlabel("simulation steps ($\\times 10^5$)")
+    ax.set_title("Actor gradient estimator, sampled at the current policy "
+                 "(magnitude & variance during training)")
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     out = args.output or os.path.join(args.logdir, "training.png")

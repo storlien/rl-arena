@@ -71,6 +71,15 @@ def parse_args() -> argparse.Namespace:
                    help="evaluate every k episodes (0 disables)")
     p.add_argument("--eval-episodes", type=int, default=16)
     p.add_argument("--save-interval", type=int, default=100)
+
+    # ---- gradient diagnostics ------------------------------------------
+    p.add_argument("--grad-var-interval", type=int, default=25,
+                   help="every k episodes, sample the actor gradient-"
+                        "estimator with extra frozen-policy windows and "
+                        "log its variance (actor_grad_var) and mean norm "
+                        "(actor_grad_mean_norm); 0 disables")
+    p.add_argument("--grad-var-samples", type=int, default=8,
+                   help="extra windows per variance measurement (>= 2)")
     return p.parse_args()
 
 
@@ -114,6 +123,8 @@ def main() -> None:
         eval_interval=args.eval_interval,
         eval_num_episodes=args.eval_episodes,
         save_interval=args.save_interval,
+        grad_var_interval=args.grad_var_interval,
+        grad_var_samples=args.grad_var_samples,
     )
 
     # ---- reproducibility ---------------------------------------------------

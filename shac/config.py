@@ -209,6 +209,31 @@ class RunConfig:
     eval_num_episodes: int = 16     # episodes per evaluation (on a separate env)
     save_interval: int = 100        # checkpoint every k episodes (+ best/last)
 
+    # --- gradient-estimator diagnostics ----------------------------------
+    # One training episode yields exactly ONE draw of the actor gradient
+    # g(theta, xi); consecutive rows mix estimator noise with the drift of
+    # the true gradient as the policy learns, so the estimator's VARIANCE
+    # is not identifiable from the training log alone (see
+    # SHACTrainer._measure_grad_variance). Every `grad_var_interval`
+    # episodes, k = `grad_var_samples` extra windows are rolled out at the
+    # CURRENT theta (no optimizer step) to sample the estimator directly:
+    #   actor_grad_var        =  E[||g||^2] - ||E[g]||^2   (trace of the
+    #                           empirical gradient covariance)
+    #   actor_grad_mean_norm  =  ||E[g]||  (best estimate of the true
+    #                           gradient norm at theta)
+    # Cost: k extra windows (~1.5 s per measurement on CPU); they advance
+    # the environment stream but are not counted as training env steps.
+    # This is the quantity behind the paper's short-horizon motivation
+    # (Sec. 3.2: BPTT's gradient variance grows with the horizon; h keeps
+    # it bounded) -- measured live along training.
+    grad_var_interval: int = 25     # measure every k episodes (0 = off)
+    grad_var_samples: int = 8       # extra windows per measurement (>= 2)
+
     def __post_init__(self):
         if self.device == "auto":
             pass                    # resolved later, needs torch import
+        assert self.grad_var_interval >= 0
+        if self.grad_var_interval > 0:
+            assert self.grad_var_samples >= 2, (
+                "gradient-variance estimation needs >= 2 windows per "
+                "measurement (RunConfig.grad_var_samples)")

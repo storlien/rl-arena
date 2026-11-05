@@ -249,7 +249,19 @@ class SHACTrainer:
     # STAGE 1+2: rollout one short-horizon window and update the ACTOR
     # (paper Eq. 5, gradient via backprop through the differentiable sim)
     # ======================================================================
-    def _rollout_and_update_actor(self) -> Dict[str, float]:
+    def _run_window(self) -> torch.Tensor:
+        """Rollout ONE short-horizon window and return the Eq. 5 actor loss
+        (normalized by N*h), with its autograd graph attached.
+
+        Shared by the actor update (which backprops and steps) and by the
+        gradient-estimator-variance measurement (which samples the
+        estimator WITHOUT stepping the optimizer -- see
+        _measure_grad_variance). Performs ALL per-window bookkeeping --
+        critic buffers, running observation statistics, per-env episode
+        step/return counters -- so both callers drive the same environment
+        and normalizer streams; only the env-step accounting and the Adam
+        step live in the training caller.
+        """
         h, N = self.h, self.num_envs
         gamma = self.cfg.gamma
 
@@ -362,8 +374,14 @@ class SHACTrainer:
                     self.episode_return[done_ids] = 0.0
                     self.episode_steps[done_ids] = 0
 
-        # Eq. 5 normalization by N*h, then ONE Adam step on the policy.
-        actor_loss = actor_loss / (N * h)
+        # Eq. 5 normalization by N*h (paper Algorithm 1).
+        return actor_loss / (N * h)
+
+    def _rollout_and_update_actor(self) -> Dict[str, float]:
+        """ONE learning episode: window rollout + ONE Adam step (Alg. 1)."""
+        N, h = self.num_envs, self.h
+        actor_loss = self._run_window()
+
         self.actor_opt.zero_grad()
         actor_loss.backward()
 
@@ -383,9 +401,69 @@ class SHACTrainer:
         }
 
     # ======================================================================
+    # DIAGNOSTIC: sample the actor-gradient ESTIMATOR at the current policy
+    # (the variance quantity behind the paper's short-horizon motivation,
+    # Sec. 3.2: BPTT gradient variance grows with horizon, h bounds it)
+    # ======================================================================
+    def _measure_grad_variance(self, k: int) -> Dict[str, float]:
+        """Sample the actor-gradient estimator k times at the CURRENT
+        theta and summarize its magnitude and variance.
+
+        WHY EXTRA SAMPLES: one training episode yields exactly ONE draw
+        g(theta, xi) of the gradient; consecutive training rows sample
+        DIFFERENT thetas (Adam moved in between), so their spread mixes
+        estimator noise with the drift of the true gradient as the policy
+        learns -- the estimator's variance is not identifiable from the
+        training log alone. Holding the policy at theta for k extra
+        windows (NO optimizer step, `.grad` untouched --
+        torch.autograd.grad) while the window randomness xi (exploration
+        noise, env resets) is resampled gives i.i.d. samples of the
+        estimator AT this point in training.
+
+        Returns:
+          actor_grad_mean_norm  ||E[g]||: mean gradient over the k
+            samples -- the best available estimate of the TRUE gradient
+            norm at theta (training itself only ever sees single draws).
+          actor_grad_var  E[||g||^2] - ||E[g]||^2: trace of the empirical
+            gradient covariance -- the scalar "gradient variance" of one
+            window's estimate.
+
+        The k windows advance the environment stream and observation
+        statistics like any window, but are NOT added to total_env_steps:
+        they contribute no learning, and keeping them out preserves the
+        comparability of the env_steps axis across runs with and without
+        this diagnostic (their wall-clock cost is still visible in
+        wall_time_s).
+        """
+        params = list(self.actor.parameters())
+        samples = []
+        for _ in range(k):
+            loss = self._run_window()
+            grads = torch.autograd.grad(loss, params)
+            # One flat float64 vector per window: the covariance trace is
+            # the difference of two similar-size terms, so the reduction
+            # is done in double precision to avoid float32 cancellation.
+            g = torch.cat([t.reshape(-1) for t in grads]).to(torch.float64)
+            if not bool(torch.isfinite(g).all()):
+                raise RuntimeError(
+                    "Non-finite actor gradient while sampling the "
+                    "estimator variance. The simulation probably diverged "
+                    "-- check action bounds/dt.")
+            samples.append(g)
+        G = torch.stack(samples)                       # [k, P]
+        mean = G.mean(dim=0)                           # [P]
+        mean_norm = float(torch.linalg.vector_norm(mean).item())
+        var = float((G * G).sum(dim=1).mean().item()) - mean_norm ** 2
+        return {"actor_grad_mean_norm": mean_norm,
+                "actor_grad_var": max(var, 0.0)}
+
+    # ======================================================================
     # STAGE 3: fit the critic to td-(lambda) targets (paper Eq. 6-7)
     # ======================================================================
-    def _update_critic(self) -> float:
+    def _update_critic(self) -> Tuple[float, float]:
+        """Stage 3. Returns (mean MSE loss, mean PRE-CLIP gradient norm)
+        over the 16*4 = 64 inner gradient steps -- the pre-clip norm is
+        what clip_grad_norm_ returns, matching actor_grad_norm."""
         # ---- target values V-tilde(s) for every state in the window ----
         with torch.no_grad():
             targets = td_lambda_values(self.rew_buf, self.next_value_buf,
@@ -402,7 +480,7 @@ class SHACTrainer:
         batch_size = max(1, obs_flat.shape[0] // self.cfg.critic_num_batch)
         num_batches = (obs_flat.shape[0] + batch_size - 1) // batch_size
 
-        total_loss, steps = 0.0, 0
+        total_loss, total_gnorm, steps = 0.0, 0.0, 0
         for _ in range(self.cfg.critic_iterations):
             for b in range(num_batches):
                 idx = slice(b * batch_size, min((b + 1) * batch_size,
@@ -417,13 +495,17 @@ class SHACTrainer:
                 for p in self.critic.parameters():
                     if p.grad is not None:
                         p.grad.nan_to_num_(0.0)
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(),
-                                               self.cfg.grad_norm_clip)
+                # clip_grad_norm_ returns the PRE-clip total norm; keep it
+                # (its mean is logged as critic_grad_norm -- previously
+                # discarded, cf. actor_grad_norm).
+                gnorm = torch.nn.utils.clip_grad_norm_(
+                    self.critic.parameters(), self.cfg.grad_norm_clip)
                 self.critic_opt.step()
 
                 total_loss += float(loss.item())
+                total_gnorm += float(gnorm.item())
                 steps += 1
-        return total_loss / max(steps, 1)
+        return total_loss / max(steps, 1), total_gnorm / max(steps, 1)
 
     # ======================================================================
     # STAGE 4: Polyak-update the target critic (paper Algorithm 1)
@@ -444,14 +526,34 @@ class SHACTrainer:
         for episode in range(1, self.cfg.num_episodes + 1):
             lr_actor, lr_critic = self._set_lrs(episode - 1)
 
+            # ---- gradient-estimator variance (diagnostic) ----
+            # Measured BEFORE this episode's rollout so the k extra
+            # windows and the episode's own training window share the
+            # SAME theta: the row's actor_grad_norm (one training draw)
+            # and actor_grad_var (the estimator's variance at that
+            # policy) then describe the same policy.
+            gv = (self._measure_grad_variance(self.run_cfg.grad_var_samples)
+                  if self.run_cfg.grad_var_interval > 0
+                  and episode % self.run_cfg.grad_var_interval == 0
+                  else None)
+
             stats = self._rollout_and_update_actor()     # stages 1-2
             if self.use_critic:
-                stats["critic_loss"] = self._update_critic()   # stage 3
+                (stats["critic_loss"],
+                 stats["critic_grad_norm"]) = self._update_critic()  # st. 3
                 self._update_target_critic()                   # stage 4
             else:
-                # Ablation (--no-critic): no critic stages; log an empty
-                # cell so the CSV schema is identical across arms.
+                # Ablation (--no-critic): no critic stages; log empty
+                # cells so the CSV schema is identical across arms.
                 stats["critic_loss"] = None
+                stats["critic_grad_norm"] = None
+
+            # Sparse diagnostic columns (None between measurements, like
+            # the eval columns between evals). Always present so every row
+            # passes the same key set (see RunLogger.log).
+            stats["actor_grad_var"] = gv["actor_grad_var"] if gv else None
+            stats["actor_grad_mean_norm"] = (gv["actor_grad_mean_norm"]
+                                             if gv else None)
 
             # ---- periodic evaluation on a separate env (deterministic) ----
             eval_mean = eval_std = None
@@ -575,6 +677,9 @@ class SHACTrainer:
         if row["eval_return_mean"] is not None:
             msg += (f" | EVAL ret {row['eval_return_mean']:8.1f}"
                     f" +/- {row['eval_return_std']:.1f}")
+        if row.get("actor_grad_var") is not None:
+            msg += (f" | gvar {row['actor_grad_var']:.3g}"
+                    f" | gmean {row['actor_grad_mean_norm']:.3g}")
         print(msg, flush=True)
 
 
