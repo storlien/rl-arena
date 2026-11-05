@@ -22,6 +22,13 @@ log-std vector (one entry per action dimension, init -1 -> sigma ~= 0.37)
 rather than a state-dependent network output; we follow the official code
 (the paper's sigma_theta(s) notation is looser than what was released).
 
+SHACConfig.actor_state_std = True switches to that SAC-style state-dependent
+parameterization: the actor head emits [mu | log_std(s)] (2 x action_dim),
+log_std clamped to [LOG_STD_MIN, LOG_STD_MAX] as in SAC. The log-std half
+of the head is zero-initialized with bias logstd_init, so both variants
+start from the IDENTICAL sigma(s) = exp(logstd_init) and the A/B between
+them is clean (only the ability to learn state dependence differs).
+
 The trainer additionally squashes the sampled action with tanh before
 applying it (official code: `env.step(torch.tanh(actions))`), which bounds
 the applied force; gradients flow through tanh.
@@ -31,6 +38,12 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+
+
+# SAC-style bounds on the state-dependent log-std head (Haarnoja et al.,
+# "Soft Actor-Critic" clamps log_std to [-20, 2]).
+LOG_STD_MIN = -20.0
+LOG_STD_MAX = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -67,34 +80,91 @@ def build_mlp(input_dim: int, output_dim: int, units: Tuple[int, ...],
 # Actor
 # ---------------------------------------------------------------------------
 class GaussianActor(nn.Module):
-    """Stochastic Gaussian policy with a global learnable standard deviation.
+    """Stochastic Gaussian policy.
 
-    forward(obs)             -> reparameterized sample a ~ N(mu(s), sigma)
+    forward(obs)             -> reparameterized sample a ~ N(mu(s), sigma(s))
     forward(obs, deterministic=True) -> mu(s)     (used for evaluation)
+    mu_sigma(obs)            -> (mu(s), sigma(s)) tensors for analysis
+
+    Two parameterizations of sigma (SHACConfig.actor_state_std):
+      * global (default, official SHAC): one learnable log-std parameter
+        per action dimension -- sigma is the same at every state.
+      * state (SAC-style): the MLP head emits [mu | log_std(s)]; log_std
+        is clamped to [LOG_STD_MIN, LOG_STD_MAX]. The log-std half of the
+        head is zero-initialized (bias = logstd_init), so training STARTS
+        at sigma(s) == exp(logstd_init) for every s and only learns state
+        dependence if the gradient asks for it.
     """
 
     def __init__(self, obs_dim: int, action_dim: int, units: Tuple[int, ...],
-                 logstd_init: float = -1.0):
+                 logstd_init: float = -1.0, state_std: bool = False):
         super().__init__()
-        self.mu_net = build_mlp(obs_dim, action_dim, units)
-        # One learnable log-std per action dimension (official ActorStochasticMLP).
-        self.logstd = nn.Parameter(torch.full((action_dim,), float(logstd_init)))
         self.action_dim = action_dim
+        self.state_std = state_std
+        # policy_std accumulator for the state mode (see std()); kept in
+        # both modes so reset_std() is always safe to call.
+        self._std_acc, self._std_n = 0.0, 0
+        if state_std:
+            # One MLP with a SAC-style [mu | log_std(s)] head.
+            self.mu_net = build_mlp(obs_dim, 2 * action_dim, units)
+            head = [m for m in self.mu_net.modules()
+                    if isinstance(m, nn.Linear)][-1]
+            with torch.no_grad():
+                head.weight[action_dim:].zero_()
+                head.bias[action_dim:] = float(logstd_init)
+        else:
+            self.mu_net = build_mlp(obs_dim, action_dim, units)
+            # One learnable log-std per action dimension (official ActorStochasticMLP).
+            self.logstd = nn.Parameter(
+                torch.full((action_dim,), float(logstd_init)))
+
+    def mu_sigma(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Mean and std of the policy at obs: both [batch, action_dim]."""
+        if not self.state_std:
+            mu = self.mu_net(obs)
+            sigma = self.logstd.exp().expand_as(mu)
+            return mu, sigma
+        mu, log_std = self.mu_net(obs).split(self.action_dim, dim=-1)
+        sigma = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX).exp()
+        return mu, sigma
 
     def forward(self, obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        mu = self.mu_net(obs)
+        mu, sigma = self.mu_sigma(obs)
         if deterministic:
             return mu
-        sigma = self.logstd.exp()
         # Reparameterization: the noise is external to the parameters, so
         # d(sample)/d(theta) = d(mu)/d(theta) + epsilon * d(sigma)/d(theta).
         eps = torch.randn_like(mu)
+        if self.state_std:
+            # policy_std diagnostics: accumulate the mean sigma(s) over
+            # the stochastic forward calls since the last reset_std();
+            # std() reads and resets the accumulator.
+            with torch.no_grad():
+                self._std_acc += float(sigma.mean())
+                self._std_n += 1
         return mu + sigma * eps
+
+    def reset_std(self) -> None:
+        """Start a fresh policy_std accumulation window (state mode)."""
+        self._std_acc, self._std_n = 0.0, 0
 
     @torch.no_grad()
     def std(self) -> float:
-        """Current global action std (logged for diagnostics)."""
-        return float(self.logstd.exp().mean().item())
+        """Current action std (logged for diagnostics).
+
+        Global mode: the learnable sigma. State mode: the mean sigma(s)
+        over the stochastic forward calls since the last reset_std()/std()
+        call -- i.e. the average exploration noise over the states of the
+        episode just rolled out (SHACTrainer resets the accumulator at the
+        start of every window, so probe windows never pollute it).
+        Deterministic eval calls are not accumulated."""
+        if not self.state_std:
+            return float(self.logstd.exp().mean().item())
+        if self._std_n == 0:
+            return 0.0
+        m = self._std_acc / self._std_n
+        self.reset_std()
+        return m
 
 
 # ---------------------------------------------------------------------------

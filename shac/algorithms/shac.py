@@ -176,8 +176,10 @@ class SHACTrainer:
         # ---- actor and critics ----
         self.use_critic = self.cfg.use_critic
         self.actor = GaussianActor(self.num_obs, self.num_actions,
-                                   self.cfg.actor_units,
-                                   self.cfg.actor_logstd_init).to(device)
+                                    self.cfg.actor_units,
+                                    self.cfg.actor_logstd_init,
+                                    state_std=self.cfg.actor_state_std
+                                    ).to(device)
         if self.use_critic:
             self.critic = Critic(self.num_obs, self.cfg.critic_units).to(device)
             # Target value network V' (paper Algorithm 1). Its PARAMETERS are
@@ -281,6 +283,11 @@ class SHACTrainer:
         rew_acc = torch.zeros(N, device=self.device)
         gamma_pow = torch.ones(N, device=self.device)
         actor_loss = torch.zeros((), device=self.device)
+
+        # Fresh policy_std accumulation window (state-std mode): the
+        # diagnostics' sigma-mean below then covers exactly this window's
+        # states, never the gradient-probe's or previous episodes'.
+        self.actor.reset_std()
 
         # Cut gradients from previous learning episodes; continue physically.
         obs_raw = self.env.initialize_trajectory()

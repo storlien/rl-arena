@@ -65,6 +65,13 @@ def parse_args() -> argparse.Namespace:
                         "short-horizon window reward of paper Eq. 5 (no "
                         "terminal bootstrap, no td-(lambda), no target "
                         "network); i.e. discounted short-horizon BPTT")
+    p.add_argument("--state-std", action="store_true",
+                   help="experimental A/B: SAC-style STATE-DEPENDENT policy "
+                        "std (the paper's sigma_theta(s) notation) -- the "
+                        "actor head emits [mu | log_std(s)], clamped to "
+                        "[-20, 2] as in SAC, instead of the official global "
+                        "learnable sigma. Zero-init head: both variants start "
+                        "from the same sigma = exp(logstd_init)")
 
     # ---- evaluation / logging cadence ------------------------------------
     p.add_argument("--eval-interval", type=int, default=10,
@@ -115,6 +122,7 @@ def main() -> None:
         critic_learning_rate=args.critic_lr,
         target_critic_alpha=args.target_alpha,
         use_critic=not args.no_critic,
+        actor_state_std=args.state_std,
     )
     run_cfg = RunConfig(
         seed=args.seed,

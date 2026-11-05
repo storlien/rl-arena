@@ -31,6 +31,8 @@ uv run python tests/test_td_lambda.py
 uv run python tests/test_running_stats.py
 uv run python tests/test_actor_loss.py
 uv run python tests/test_no_critic.py
+uv run python tests/test_grad_var.py
+uv run python tests/test_state_std.py
 
 # train (CPU; ~2-5 minutes for the full 500 episodes on a laptop)
 uv run python -m shac.train --device cpu
@@ -151,6 +153,56 @@ dies, 1 diverges). Pass `--no-critic` to try it yourself.
 
 ---
 
+## Experiment: SAC-style state-dependent σ(s)
+
+The paper writes the stochastic policy as a ~ N(mu_theta(s), sigma_theta(s))
+— a state-DEPENDENT standard deviation — but the official released code
+uses a single GLOBAL learnable log-std. `--state-std` switches this repo
+to the paper's parameterization, SAC-style: the actor head emits
+[mu | log_std(s)] (clamped to [-20, 2] as in SAC), the log-std half is
+zero-initialized so both variants start from the identical
+sigma = exp(-1) ~= 0.368, and — since the SHAC loss has no
+entropy/log-prob term — sigma(s) learns only through the reparameterized
+noise path (dL/dsigma(s) = dL/du * eps).
+
+A/B at the paper budget (500 episodes, seed 0, identical hyperparameters
+and wall time, ~87 s each):
+
+| | global σ (default) | state σ(s) (`--state-std`) |
+|---|---|---|
+| best eval return | **−274.0** | −311.8 |
+| final policy std | 0.058 | 0.0006 (window mean) |
+| first eval > −400 | episode 110 | episode 360 |
+| grad-estimator Var (ep 25 / ep 500) | 51 / 3.3 | 974 / 43.7 |
+
+![A/B: global learnable sigma vs state-dependent sigma(s)](figures/state_std_ab.png)
+
+Three findings:
+
+1. **sigma(s) genuinely becomes state-dependent** — near-deterministic
+   when balanced (3e-4), loudest mid-swing (0.036): a 132x spread over
+   (theta, theta_dot), exactly the per-state adaptivity the paper's
+   notation implies.
+2. **But it collapses exploration ~100x harder than the global variant.**
+   With no entropy bonus in the objective (the actual "SAC part" of
+   SAC-style sigma(s)), the head races sigma(s) -> 0 state-by-state,
+   premature convergence sets in, and the best return loses ~38 points
+   at this budget.
+3. **The sigma(s) parameters inject pure-noise gradient**: they receive
+   gradient only through the eps-noise path, and the actor
+   gradient-estimator variance is ~20x higher early (974 vs 51 at
+   episode 25).
+
+Verdict: at the paper budget on CartPole the official global sigma wins;
+making sigma state-dependent without also adding SAC's max-entropy
+objective removes exploration faster, not better. In this mode
+`policy_std` logs the window-mean of sigma(s); checkpoints of the two
+modes are not architecture-compatible (load with the same `--state-std`
+flag). Tests: tests/test_state_std.py. Pass `--state-std` to try it
+yourself.
+
+---
+
 ## Repository layout (suggested reading order)
 
 ```
@@ -204,6 +256,11 @@ tests/                           correctness of everything above
 ├── test_no_critic.py            --no-critic == SHAC with a zeroed target
 │                                critic, bit-for-bit; smoke run +
 │                                checkpoint round-trip
+├── test_grad_var.py             gradient-estimator variance diagnostic:
+│                                purity, same-estimator, CSV schema
+├── test_state_std.py            SAC-style state-dependent sigma(s): init
+│                                equivalence, clamp bounds, gradient
+│                                path, train integration, ckpt round-trip
 └── test_running_stats.py        running statistics == batch statistics
 
 scripts/

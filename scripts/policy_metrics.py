@@ -55,7 +55,9 @@ def load_policy(path, device):
     env_cfg = EnvConfig(**ckpt["env_cfg"])
     actor = GaussianActor(5, 1,
                           tuple(ckpt["algo_cfg"]["actor_units"]),
-                          ckpt["algo_cfg"]["actor_logstd_init"]).to(device)
+                          ckpt["algo_cfg"]["actor_logstd_init"],
+                          state_std=ckpt["algo_cfg"].get(
+                              "actor_state_std", False)).to(device)
     actor.load_state_dict(ckpt["actor"])
     actor.eval()
     rms = None

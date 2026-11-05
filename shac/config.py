@@ -167,6 +167,20 @@ class SHACConfig:
     # (state-dependent), but the released implementation uses a single
     # learnable sigma = exp(logstd) initialized to exp(-1) ~= 0.37.
 
+    actor_state_std: bool = False
+    # Experimental A/B (--state-std): switch sigma to the SAC-style
+    # STATE-DEPENDENT parameterization the paper's notation describes --
+    # the actor head emits [mu | log_std(s)], log_std clamped to [-20, 2]
+    # as in SAC. The log-std half of the head is zero-initialized with
+    # bias actor_logstd_init, so both variants start from the IDENTICAL
+    # sigma(s) = exp(actor_logstd_init) and differ only in whether sigma
+    # can become state-dependent. NOTE: the SHAC actor loss has no
+    # entropy/log-prob term (unlike SAC's objective) -- sigma(s) learns
+    # only through the reparameterized noise in the action path, i.e.
+    # dL/dsigma(s) = dL/du * eps. policy_std then logs the window-mean
+    # of sigma(s). Checkpoints from the two modes are NOT
+    # architecture-compatible (load with the same --state-std).
+
     # --- ablation ------------------------------------------------------------
     use_critic: bool = True
     # Ablation switch (--no-critic): when False, the actor loss is ONLY the
