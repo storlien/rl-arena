@@ -257,19 +257,26 @@ trajectories, the budget interpretation, and the SAPO relation — is
 `--entropy-target` / `--entropy-lr` / `--entropy-init-alpha`) to try
 it yourself.
 
-### Beating the paper baseline (SAPO choice V, h=64)
+### Beating the paper baseline (SAPO-inspired V-style, h=64; full SAPO tested)
 
 Everything above keeps the paper's hyperparameters fixed and changes
 the OBJECTIVE. [BEAT_BASELINE.md](BEAT_BASELINE.md) goes the other way:
 sweep the machinery around the objective (Polyak, td-λ, horizon, N,
 critic ensembles, warmup, activation/optimizer) at the paper budget to
-beat plain SHAC's best eval of −274.0. Winner: **SiLU + AdamW (SAPO's
-choice V) + h=64 → best eval −234/−215/−262 over 3 seeds vs the
-baseline's −274/−323/−324** — every improved seed beats every baseline
-seed. The paper's critic machinery survives every challenge; its
+beat plain SHAC's best eval of −274.0. Winner: **SiLU + AdamW (a single
+SAPO-inspired change, NOT SAPO itself) + h=64 → best eval −234/−215/−262
+over 3 seeds vs the baseline's −274/−323/−324** — every improved seed
+beats every baseline seed. A **full faithful SAPO reimplementation**
+(all five design choices: entropy+dual, Ĥ-normalization, state-σ policy
+class, double-critic/no-targets with the paper's average-in-actor-return
+pooling, SiLU/AdamW/clip-0.5) was then tested alongside: mean −266.5 —
+better than the baseline, worse than its own V-style ingredient alone.
+The paper's critic machinery survives every challenge; its
 network/optimizer stack was the headroom. Pass `--activation silu
 --optimizer adamw` (optionally `--horizon 64` / `--critic-ensemble` /
-`--no-target-critic` / `--critic-warmup`) to try it yourself.
+`--no-target-critic` / `--actor-bootstrap-pool` / `--critic-warmup` /
+`--grad-clip`, or everything together with the full-SAPO command in the
+doc) to try it yourself.
 
 ---
 
@@ -291,8 +298,10 @@ MAX_ENTROPY.md                   the max-entropy objective A/B write-up
                                   negative result and SAPO's scope)
 BEAT_BASELINE.md                 the beat-the-baseline sweep write-up
                                   (Polyak/td-lambda/h/N/warmup/ensemble/
-                                  SiLU+AdamW arms; SAPO choice V + h=64
-                                  wins over 3 seeds)
+                                  SiLU+AdamW arms; SHAC + SAPO-inspired
+                                  V-style + h=64 wins over 3 seeds; a
+                                  full faithful SAPO reimplementation
+                                  tested alongside lands in between)
 PENDULUM.md                      the second task's write-up: Pendulum
                                   Swing-Up (Gym task spec + repo
                                   simulation conventions; not a paper

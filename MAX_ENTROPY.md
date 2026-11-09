@@ -90,8 +90,11 @@ Design choices, all SAPO's unless noted:
    SiLU/AdamW/clip changes (V) are NOT included, isolating the entropy
    objective itself.
 - Works with BOTH σ parameterizations — the two experiment flags are
-   orthogonal; `--state-std --max-entropy` is the faithful CartPole
-   SAPO arm.
+   orthogonal; `--state-std --max-entropy` covers choices I+II+III.
+   NOTE: this is still NOT full SAPO — their choices IV (double critic,
+   no targets, average pooling in the actor return) and V (SiLU/AdamW/
+   clip-0.5) are separate; the complete faithful combination is the
+   `cp_sapo_full` arm in [BEAT_BASELINE.md](BEAT_BASELINE.md).
 - Checkpoints load across the flag (α is stored as a separate
    `entropy_alpha` field, restored by max-entropy trainers and ignored
    by plain ones); the CSV grows `entropy_alpha` (the pre-dual α that

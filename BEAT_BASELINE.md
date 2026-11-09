@@ -16,10 +16,24 @@ Adam → AdamW) plus the longer horizon h = 64: best evals **−234.4 /
 baseline seed**; the paired mean improvement is ≈ 70 eval points. SiLU +
 AdamW alone already wins on all three seeds (mean −253.6). Everything
 else we tried — slower Polyak, both td-λ directions, more parallel envs,
-TD3-style critic warmup, and SAPO's double-critic-without-targets (choice
-IV) — *lost* to the baseline. The paper's critic machinery (fast Polyak
-0.2, td-λ 0.95) is exactly right; the paper's *network/optimizer stack*
-is where the headroom was.
+TD3-style critic warmup, a SAPO-inspired double-critic-without-targets
+(choice IV) — *lost* to the baseline. **Full SAPO** (all five design
+choices together, faithful to the paper, implemented after these arms)
+lands *between*: mean −266.5 — better than the baseline, but its gain is
+mostly spent by the entropy tax and the state-σ policy class. The paper's
+critic machinery (fast Polyak 0.2, td-λ 0.95) is exactly right; the
+paper's *network/optimizer stack* is where the headroom was.
+
+> **Naming.** This document's arms are **SHAC with single SAPO-inspired
+> changes**, not SAPO. SAPO is the *joint* algorithm — all five design
+> choices (entropy objective, Ĥ-normalization, state-σ policy class,
+> double-critic/no-targets, SiLU/AdamW/clip-0.5) active simultaneously on
+> top of SHAC's FOBG training loop. Each `cp_shac_sapo*` arm below flips
+> ONE knob with the entropy machinery off, so none of them is SAPO; only
+> the `cp_sapo_full` arm (§ Full SAPO) is an actual SAPO reimplementation
+> (on our envs). Run directories keep this convention:
+> `cp_shac_sapo*` = SHAC + one SAPO-inspired change,
+> `cp_sapo_full` = full SAPO.
 
 ---
 
@@ -52,8 +66,16 @@ in tier 3.
 | arm | change | inspiration | prediction | best eval | verdict |
 |---|---|---|---|---|---|
 | `cp_warmup10` | critic-only training for the first 10 episodes (actor frozen, rollout still runs) | TD3's delayed policy updates; the critic MSE starts ~800, so early actor gradients bootstrap through a garbage critic | better: actor steps only once the bootstrap is meaningful | −350.8 | **worse** |
-| `cp_sapo_iv` | critic ensemble K=2, min-pooled bootstrap, **no** target network, no Polyak | SAPO design choice IV (SAC/CrossQ lineage) | neutral-to-better (variance reduction) | −319.8 | worse |
-| `cp_sapo_v` | ELU → **SiLU**, Adam → **AdamW** (identical lr/betas), both networks | SAPO design choice V | neutral (seems cosmetic) | **−249.4** | **beats baseline** |
+| `cp_shac_sapoiv` | critic ensemble K=2, min-pooled bootstrap, **no** target network, no Polyak | SAPO design choice IV (SAC/CrossQ lineage) | neutral-to-better (variance reduction) | −319.8 | worse |
+| `cp_shac_sapov` | ELU → **SiLU**, Adam → **AdamW** (identical lr/betas), both networks | SAPO design choice V | neutral (seems cosmetic) | **−249.4** | **beats baseline** |
+
+(Note the run-directory rename: these arms were first written up as
+`cp_sapo_iv` / `cp_sapo_v`; renamed to `cp_shac_sapo*` because a single
+flipped knob with the entropy machinery off is **not SAPO** — see the
+naming note above. The original `cp_sapo_iv` run also pooled the
+ensemble with min in the ACTOR's window loss; SAPO's paper specifies
+average there and min only for critic targets — `--actor-bootstrap-pool`
+now exposes both.)
 
 The surprise is the *size ordering*: the changes with the strongest
 theoretical motivation (ensemble targets, delayed updates) lost; the
@@ -68,18 +90,63 @@ regime that is update-limited, not data-limited.
 | arm | seed 0 | seed 1 | seed 2 | mean best | mean last-5 |
 |---|---|---|---|---|---|
 | baseline (paper) | −274.0 | −323.4 | −323.8 | −307.1 | −350.3 |
-| SAPO V (SiLU/AdamW) | −249.4 | −257.7 | −253.7 | −253.6 | −293.9 |
-| **SAPO V + h = 64** | **−234.4** | **−215.1** | −261.8 | **−237.1** | −281.7 |
+| SHAC + V-style (SiLU/AdamW) | −249.4 | −257.7 | −253.7 | −253.6 | −293.9 |
+| **SHAC + V-style + h = 64** | **−234.4** | **−215.1** | −261.8 | **−237.1** | −281.7 |
 
-(`runs/cp_base_s{1,2}/`, `runs/cp_sapo_v/`, `runs/cp_v_s{1,2}/`,
-`runs/cp_vh64_s{0,1,2}/`; behavioral metrics on the best checkpoints:
-all three V+h64 policies solve the task — 100% swing-up, t_up ≈ 58
-steps, balance ≈ 3° — i.e. the improvement is convergence SPEED toward
-the same solved behavior, exactly matching the "budget gap" framing.)
+(`runs/cp_base_s{1,2}/`, `runs/cp_shac_sapov/`,
+`runs/cp_shac_sapov_s{1,2}/`, `runs/cp_shac_sapov_h64_s{0,1,2}/`;
+behavioral metrics on the best checkpoints: all three V-style+h64
+policies solve the task — 100% swing-up, t_up ≈ 58 steps, balance ≈ 3° —
+i.e. the improvement is convergence SPEED toward the same solved
+behavior, exactly matching the "budget gap" framing.)
 
-The seed separation is complete: every V seed and every V+h64 seed
-beats every baseline seed. The winner's worst seed (−261.8) still beats
-the baseline's best seed (−274.0).
+The seed separation is complete: every V-style seed and every
+V-style+h64 seed beats every baseline seed. The winner's worst seed
+(−261.8) still beats the baseline's best seed (−274.0).
+
+### Full SAPO — the faithful reimplementation, tested alongside
+
+After the arms above, SAPO was implemented **in full and faithfully**
+(paper §4.2, all five design choices active simultaneously — the only
+configuration that deserves the name SAPO):
+
+| choice | flags |
+|---|---|
+| I: entropy + dual α | `--max-entropy` (target = Ĥ = −dim(A)/2 = −0.5) |
+| II: Ĥ-normalized entropy | built into the max-entropy machinery |
+| III: state-σ policy class | `--state-std` |
+| IV: 2× critic, no targets, **average in the actor return / min in the targets** | `--critic-ensemble 2 --no-target-critic --actor-bootstrap-pool avg` |
+| V: SiLU + AdamW + **grad-clip 0.5** | `--activation silu --optimizer adamw --grad-clip 0.5` |
+
+Backbone: SHAC's paper CartPole config (N=64, h=32, 500 eps, seed 0/1/2,
+`runs/cp_sapo_full{,_s1,_s2}`). **Prediction (preregistered):** V is the
+only ingredient proven positive here and entropy/III/IV were each
+negative, so full SAPO should beat the baseline but lose to
+V-style+h64 — unless faithful average pooling rescues choice IV.
+
+| arm | seed 0 | seed 1 | seed 2 | mean best | mean last-5 |
+|---|---|---|---|---|---|
+| baseline (paper) | −274.0 | −323.4 | −323.8 | −307.1 | −350.3 |
+| **full SAPO (all 5 choices)** | −272.9 | −277.6 | −249.0 | **−266.5** | −294.0 |
+| SHAC + V-style (for reference) | −249.4 | −257.7 | −253.7 | −253.6 | −293.9 |
+
+Result: **prediction confirmed.** Full SAPO beats the baseline on the
+mean (−266.5 vs −307.1) but with NO seed separation (−277.6 loses to the
+baseline's best −274.0), and it loses to SHAC + V-style alone
+(−253.6): the entropy tax (~34 points, MAX_ENTROPY.md) plus the state-σ
+policy class eat most of V's gain. The machinery itself worked exactly
+as SAPO specifies — the dual annealed α 1.0 → 0.23 while holding the
+policy entropy at H ≈ −0.57 vs the −0.5 target, and σ(s) stayed alive
+(0.37 → 0.14, vs the σ-collapse to 0.058 the plain objective produces).
+So this is a clean negative on SAPO-as-a-whole at this budget, not a
+broken implementation: on a task SHAC already solves, SAPO's insurance
+premium costs more than its architecture discount returns. Two caveats:
+(i) the earlier IV-style arm's min-pooled actor bootstrap is now known
+to be unfaithful, so choice IV's solo verdict carries that asterisk —
+though full SAPO (with faithful pooling) still underperforms V alone,
+which bounds IV's contribution here; (ii) SAPO's published wins are on
+massively-parallel GPU tasks where SHAC stalls — a regime our toy
+budget deliberately does not reproduce.
 
 ## Interpretation
 
@@ -113,15 +180,18 @@ hand:
 
 SAPO's choice V was dismissed in MAX_ENTROPY.md's accounting as a
 bundle-in ({III,IV,V} = +0.5% on DFlex rigid-body tasks) — on CartPole
-it is the whole show. Our decomposition: V alone ≈ 54 points, IV alone
-negative, III alone (STATE_STD.md) negative. SAPO's own ablations point
-the same direction for rigid-body tasks (their Table 14, +0.5% for
-{III,IV,V} without entropy) — but note their bundle did NOT include the
-h change, and their claim was about local-minimum escape, not
-convergence speed. The reconciled picture: on tasks SHAC already
-solves, choice V is a free ≈ 20% speedup; on tasks where SHAC stalls,
-SAPO's entropy term remains the part that matters (and our pendulum
-result bounds even that).
+it is the whole show. Our decomposition: V-style alone ≈ 54 points,
+IV-style negative, III alone (STATE_STD.md) negative, and **full SAPO
+(all five choices, faithful pooling and clip) lands in between at mean
+−266.5** — its positive ingredient is diluted by the entropy objective
+and the policy-class change that SAPO couples to it. SAPO's own
+ablations point the same direction for rigid-body tasks (their Table 14,
++0.5% for {III,IV,V} without entropy) — but note their bundle did NOT
+include the h change, and their claim was about local-minimum escape,
+not convergence speed. The reconciled picture: on tasks SHAC already
+solves, choice V is a free ≈ 20% speedup, and the rest of SAPO is a net
+cost; on tasks where SHAC stalls, SAPO's entropy term remains the part
+that matters (and our pendulum result bounds even that).
 
 ## Reproducing
 
@@ -132,7 +202,7 @@ for flags in "--target-alpha 0.995" "--td-lambda 0.98" "--td-lambda 0.90" \
   uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 0 $flags
 done
 
-# tier 2: architecture arms
+# tier 2: architecture arms (SHAC + one SAPO-inspired change each)
 uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 0 \
     --critic-warmup 10
 uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 0 \
@@ -140,7 +210,17 @@ uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 0 \
 uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 0 \
     --activation silu --optimizer adamw
 
-# tier 3: multi-seed confirmation (baseline seeds 1-2, V seeds 1-2, V+h64 seeds 1-2)
+# full SAPO: all five design choices, faithful to paper section 4.2
+# (entropy+dual, H-bar normalization, state-std policy class, 2 critics
+# with average pooling in the actor return / min in the targets, no
+# target networks, SiLU + AdamW + grad-clip 0.5)
+uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 0 \
+    --max-entropy --state-std \
+    --critic-ensemble 2 --no-target-critic --actor-bootstrap-pool avg \
+    --activation silu --optimizer adamw --grad-clip 0.5
+
+# tier 3: multi-seed confirmation (baseline seeds 1-2, V-style seeds 1-2,
+# V-style+h64 seeds 1-2, full-SAPO seeds 1-2)
 uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 1
 uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 2
 uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 1 \
@@ -153,10 +233,16 @@ uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 1 \
     --horizon 64 --activation silu --optimizer adamw
 uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed 2 \
     --horizon 64 --activation silu --optimizer adamw
+for s in 1 2; do
+  uv run python -m shac.train --env cartpole --device cpu --threads 1 --seed $s \
+      --max-entropy --state-std \
+      --critic-ensemble 2 --no-target-critic --actor-bootstrap-pool avg \
+      --activation silu --optimizer adamw --grad-clip 0.5
+done
 
 # per-run training figures + behavior metrics
-uv run python scripts/plot_training.py runs/cp_vh64_s0
-uv run python scripts/policy_metrics.py runs/cp_vh64_s0/best_policy.pt
+uv run python scripts/plot_training.py runs/cp_shac_sapov_h64_s0
+uv run python scripts/policy_metrics.py runs/cp_shac_sapov_h64_s0/best_policy.pt
 ```
 
 All run directories are gitignored (`runs/`) and regenerable above.
