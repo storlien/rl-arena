@@ -224,7 +224,47 @@ widening the target to 0.0 *helps* (MAX_ENTROPY.md's raised-target
 cross-check), here it strictly hurts. Exploration is cheap on one and
 expensive on the other.
 
-### 5.3 Open levers (not yet run)
+### 5.3 The horizon question: is 4 s just too short to swing up?
+
+The GIFs show every policy orbiting the top without capturing, so: is
+the torque cap the blocker, or the horizon? Both were tested.
+
+**The torque cap is real but faithful.** Gym's spec: u ∈ [−2, 2] N·m
+against a gravity torque of m·g·l = 9.81 N·m — 4.9× stronger. Static
+lift is impossible (max actuator work over a half-turn, 2·π ≈ 6.3 J,
+is a third of the 2·m·g·l = 19.6 J hanging→upright deficit), so the
+link MUST be pumped over multiple swings. The balance basin is razor
+thin: holding torque m·g·l·sin(θ) exceeds the cap beyond **θ ≈ 11.5°**,
+so capture is only possible if the link arrives near-upright AND slow.
+
+**A hand-designed controller locates the binding constraint.** Classic
+energy-shaping swing-up (u = k·(E* − E)·ω, clipped) + PD catch, run in
+our exact env: pump-up to the top cone takes **231 steps ≈ 3.9 s** —
+essentially the whole H = 240 (4 s) episode, leaving a 9-step (0.15 s)
+hold. The SAME controller at H = 480 captures and balances for 4.2 s
+straight. So at H = 240 capture is *physically* ~impossible; the
+baseline's 18.8%-swing-up "orbit" is the best available behavior.
+
+**But doubling the horizon does not fix learning.** Three seeds at
+H = 480 (500 eps, else paper config, `runs/pendulum_H480_s{0,1,2}`):
+best −1327/−1380/−1330, and the behavioral metrics are IDENTICAL to the
+H = 240 plateau — swing-up fraction 18.8% on all seeds, t_up ≈ 224,
+balance ≈ 57–60°. The policies reach the top at the same ~3.7 s and
+then orbit through the extra 4 s (see
+`runs/pendulum_H480_s0/best_policy_rollout.gif`). The task is solvable
+at H = 480 — the hand controller proves it — but the capture maneuver
+(arriving near-upright AND slow, inside an ~11.5° basin) is never
+sampled and reinforced: orbiting is a locally flat optimum whose reward
+gradient does not point at the precise deceleration.
+
+**Conclusion.** The H = 240 horizon made capture physically impossible
+and the orbit optimal; H = 480 makes capture possible but learning
+still walks past it. The remaining blocker is exploration/credit for a
+maneuver whose basin is ~11.5° wide — an algorithm problem (or a reward
+that prices energy near E*, e.g. shaping toward E* = m·g·l), not a
+physics or horizon problem.
+
+### 5.4 Open levers (not yet run)
 
 * **σ₀ init**: `actor_logstd_init` −1.0 → −0.5 (σ₀ 0.37 → 0.61) without
   entropy — widen early exploration on the task's own schedule instead
