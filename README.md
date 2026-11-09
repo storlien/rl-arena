@@ -1,10 +1,12 @@
-# SHAC — Short-Horizon Actor-Critic on CartPole Swing-Up
+# SHAC — Short-Horizon Actor-Critic (CartPole Swing-Up + Pendulum)
 
 A small, self-contained, heavily-commented implementation of **SHAC**
 (Short-Horizon Actor-Critic) from the ICLR 2022 paper
 [*Accelerated Policy Learning with Parallel Differentiable Simulation*](https://short-horizon-actor-critic.github.io/)
 (Xu et al.), applied to its simplest benchmark task, **CartPole Swing-Up**
-(paper Appendix A.3.1).
+(paper Appendix A.3.1), plus a second, structurally different environment,
+**Pendulum Swing-Up** (`--env pendulum`, not a paper task — see
+[PENDULUM.md](PENDULUM.md)).
 
 Everything — including the *differentiable simulator* — is plain PyTorch, so
 the code runs on **CPU or GPU** with no external simulation dependency, and

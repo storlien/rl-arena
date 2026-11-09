@@ -124,6 +124,12 @@ balances with small torque), eval std < 50, plus a visual rollout check.
 * The torque penalty uses the *physical* torque (`action_strength * a`),
   so the reward is invariant to rescaling the action strength; gym does
   the same.
+* Evaluation forks the global torch RNG (SHACTrainer.evaluate uses
+  `torch.random.fork_rng`), so eval episodes never perturb the training
+  rollout stream — changing `--eval-interval`/`--eval-episodes` does not
+  change a training trajectory. Runs trained before this change consumed
+  eval draws from the shared RNG: statistically equivalent, but not
+  bit-reproducible against the current code.
 * The env is unbounded below only through the wrapped angle
   (`|theta_n| <= pi`), so returns are bounded: `[-pi^2*240*(1+0.1*...), 0]`;
   in practice the worst case (hanging still) is ≈ -2369, same scale as the
