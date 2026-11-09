@@ -55,7 +55,8 @@ NVlabs/DiffRL/algorithms/shac.py -- all marked "official:" below)
   end of the window for the still-running remainder.  Terminal values are
   zero for EARLY termination (episode ended by failure) but bootstrap the
   TARGET critic on the pre-reset observation for a TIME LIMIT (the task
-  continues, only the counter resets).  CartPole only ever hits time limits.
+  continues, only the counter resets).  The environments in this repo
+  (CartPole, Pendulum) only ever hit time limits.
 
 * ACTION SQUASH: the sampled Gaussian action is squashed with tanh before
   being applied (bounding it to (-1, 1)); gradients flow through the tanh.
@@ -72,7 +73,7 @@ import torch
 import torch.nn.functional as F
 
 from shac.config import EnvConfig, SHACConfig, RunConfig
-from shac.envs.cartpole_swingup import CartPoleSwingUpEnv
+from shac.envs import make_env
 from shac.models.networks import GaussianActor, Critic
 from shac.utils.running_stats import RunningMeanStd
 
@@ -158,15 +159,17 @@ class SHACTrainer:
     """SHAC for a differentiable environment (paper Algorithm 1)."""
 
     def __init__(self, env_cfg: EnvConfig, algo_cfg: SHACConfig,
-                 run_cfg: RunConfig, device: torch.device, logger=None):
+                 run_cfg: RunConfig, device: torch.device,
+                 env_name: str = "cartpole", logger=None):
         self.env_cfg = env_cfg
         self.cfg = algo_cfg
         self.run_cfg = run_cfg
         self.device = device
         self.logger = logger
+        self.env_name = env_name
 
         # ---- environment (the parallel differentiable simulator) ----
-        self.env = CartPoleSwingUpEnv(env_cfg, device)
+        self.env = make_env(env_name, env_cfg, device)
         self.num_envs = self.env.num_envs
         self.num_obs = self.env.num_obs
         self.num_actions = self.env.num_actions
@@ -709,8 +712,8 @@ class SHACTrainer:
     @torch.no_grad()
     def evaluate(self, num_episodes: int) -> Tuple[float, float]:
         if not hasattr(self, "_eval_env"):
-            self._eval_env = CartPoleSwingUpEnv(self.env_cfg, self.device,
-                                                num_envs=num_episodes)
+            self._eval_env = make_env(self.env_name, self.env_cfg,
+                                      self.device, num_envs=num_episodes)
         env = self._eval_env
         obs = env.reset()
         returns = torch.zeros(env.num_envs, device=self.device)
@@ -718,8 +721,9 @@ class SHACTrainer:
         done_returns: List[float] = []
 
         # Run until every env has completed exactly one task episode.
-        # (CartPole episodes always last H steps; the done branch is for
-        #  generality with future early-termination environments.)
+        # (Episodes in the current envs always last H steps; the done
+        # branch is for generality with future early-termination
+        # environments.)
         while len(done_returns) < env.num_envs:
             if self.obs_rms is not None:
                 obs = self.obs_rms.normalize(obs)
@@ -751,6 +755,7 @@ class SHACTrainer:
             "obs_rms": (self.obs_rms.state_dict()
                         if self.obs_rms is not None else None),
             "env_cfg": self.env_cfg.__dict__,
+            "env_name": self.env_name,
             "algo_cfg": self.cfg.__dict__,
             # The dual-tuned temperature (None when the max-entropy
             # objective is off). Stored separately from algo_cfg so a
