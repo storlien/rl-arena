@@ -331,3 +331,42 @@ $$
 | sigma_0 | action std init | e^-1 ≈ 0.37 |
 
 All arms consume ≈ 1.02M env steps (`M * N * h`).
+
+## 10. Pendulum Swing-Up dynamics (`--env pendulum`, see PENDULUM.md)
+
+Second task (NOT in the SHAC paper): one rotational DoF `theta` measured
+from upright, torque-limited. Gym Pendulum-v1 task spec on the repo's
+simulation conventions.
+
+**Dynamics.** Lagrangian with the COM at height `l cos(theta)`:
+
+$$
+\mathcal{L} = \tfrac{1}{2} I \dot\theta^2 - m g l \cos\theta,
+\qquad I = I_{\text{com}} + m l^2
+$$
+
+Euler–Lagrange with generalized torque `u = 2 * tanh(a)`:
+
+$$
+\ddot\theta = \frac{u + m g l \sin\theta}{I}
+$$
+
+Sign: gravity drives AWAY from upright (unstable) and restores toward
+hanging (stable) — the same `+mgl sin(theta)` term as the CartPole's hinge
+equation (2). Integration, resets, reward smoothness: identical machinery
+to the CartPole (`dt = 1/60`, 4 semi-implicit substeps, `H = 240`, no early
+termination).
+
+**Observation and reward** (gym conventions):
+
+$$
+s = [\cos\theta,\ \sin\theta,\ \dot\theta],
+\qquad
+r = -\hat\theta^2 - 0.1\,\dot\theta^2 - 0.001\,u^2,
+\qquad
+\hat\theta = \mathrm{atan2}(\sin\theta, \cos\theta)
+$$
+
+Same shape as Eq. 13 (dense, differentiable, `<= 0`, maximum ~0 at the
+goal) with the cart terms replaced by a torque penalty on the physical
+torque.

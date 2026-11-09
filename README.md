@@ -27,6 +27,7 @@ uv sync
 
 # run the tests first (physics + gradient + math checks)
 uv run python tests/test_cartpole_dynamics.py
+uv run python tests/test_pendulum_dynamics.py
 uv run python tests/test_td_lambda.py
 uv run python tests/test_running_stats.py
 uv run python tests/test_actor_loss.py
@@ -37,6 +38,9 @@ uv run python tests/test_max_entropy.py
 
 # train (CPU; ~2-5 minutes for the full 500 episodes on a laptop)
 uv run python -m shac.train --device cpu
+
+# second task: Pendulum Swing-Up (NOT a SHAC paper task -- see PENDULUM.md)
+uv run python -m shac.train --env pendulum --device cpu
 
 # train on GPU instead (identical code; see "CPU vs GPU" below for the
 # one-line CUDA-torch switch in pyproject.toml)
@@ -60,6 +64,7 @@ Useful training flags (defaults are the paper's CartPole settings):
 ```bash
 uv run python -m shac.train \
     --device cpu \        # cpu | cuda | auto
+    --env cartpole \      # cartpole (paper task) | pendulum (see PENDULUM.md)
     --threads 1 \         # CPU threads; tiny ops are fastest with 1-4
     --episodes 500 \      # M  (learning episodes)
     --num-envs 64 \       # N  (parallel environments)
@@ -268,6 +273,11 @@ MAX_ENTROPY.md                   the max-entropy objective A/B write-up
                                   (SAC/SAPO-style soft returns + dual-
                                   tuned alpha, both sigma modes, the
                                   negative result and SAPO's scope)
+PENDULUM.md                      the second task's write-up: Pendulum
+                                  Swing-Up (Gym task spec + repo
+                                  simulation conventions; not a paper
+                                  task), dynamics derivation, chosen
+                                  hyperparameters, results
 MATH.md                          every formula implemented, in
                                   training-loop order (MDP, networks,
                                   actor/critic objectives, ablation)
@@ -280,10 +290,16 @@ shac/
 │   │                               (step / reset / initialize_trajectory /
 │   │                                save_state / load_state — the last two
 │   │                                are the hooks a future MPC agent uses)
-│   └── cartpole_swingup.py      3. the differentiable CartPole: equations of
-│                                   motion derived in the docstring,
-│                                   semi-implicit Euler, substeps, reward,
-│                                   resets, joint limits
+│   ├── __init__.py                the env registry (--env name -> class +
+│   │                               config dataclass)
+│   ├── cartpole_swingup.py      3. the differentiable CartPole: equations of
+│   │                               motion derived in the docstring,
+│   │                               semi-implicit Euler, substeps, reward,
+│   │                               resets, joint limits
+│   └── pendulum.py                the differentiable Pendulum Swing-Up
+│                                   (Gym Pendulum-v1 task spec; single-link
+│                                   EoM, same integration/reset machinery
+│                                   as the CartPole — see PENDULUM.md)
 ├── models/
 │   └── networks.py              4. Gaussian actor (reparameterized) + critic
 │                                   MLPs (ELU + LayerNorm, paper A.2.1)
