@@ -23,7 +23,10 @@ where SHAC stalls in local minima — CartPole at 1.02M steps isn't
 that). **Update:** the [pendulum follow-up](#the-pendulum-entropy-on-a-task-that-actually-stalls)
 below then tested exactly that regime — a task where SHAC *does* stall
 in a local optimum — and entropy still lost, narrowing the bound
-further.
+further. The [raised-target cross-check](#raising-the-target-the-cross-task-dose-response-t--00)
+adds a twist on the CartPole side: there, widening the target *helps*
+(gap to plain 40 → 24 points), the opposite ordering from the pendulum —
+the dose-response is a bet on how expensive exploration is per task.
 
 ---
 
@@ -205,6 +208,49 @@ pure-noise ε-path still dominates the state+ent arm's early variance,
 while the entropy's direct log-σ gradient adds a modest amount to the
 global arm. Not the deciding factor here.
 
+### Raising the target: the cross-task dose-response (t = 0.0)
+
+The [pendulum follow-up](#the-pendulum-entropy-on-a-task-that-actually-stalls)
+below found target ↑ ⇒ worse, monotonically. The natural cross-check on
+CartPole: two more arms at Ĥ = 0.0 (whose μ = 0 equilibrium is
+σ ≈ 0.42, *above* the init 0.37, where −0.5 floors at 0.15). Not
+preregistered — run after seeing the pendulum's monotone result, with
+the pendulum prediction ("wider floor ⇒ worse") — **refuted**:
+
+| arm | best eval (ep) | last 5 evals | σ end | α end | swing-up | t_up | balance |
+|---|---|---|---|---|---|---|---|
+| plain global | **−274.0** (500) | −322.7 ± 55 | 0.058 | — | 100% | 60 | 2.9° |
+| plain state | −311.8 (490) | −350.0 ± 24 | 0.001 | — | 100% | 72 | 3.2° |
+| global+ent t = −0.5 | −314.3 (480) | −368.7 ± 46 | 0.163 | 0.24 | 100% | 69 | 3.2° |
+| global+ent t = 0.0 | **−298.5** (500) | −330.9 ± 28 | 0.290 | 0.82 | 100% | 71 | 3.2° |
+| state+ent t = −0.5 | −308.6 (490) | −349.2 ± 26 | 0.142 | 0.23 | 100% | 65 | 2.7° |
+| state+ent t = 0.0 | **−302.9** (440) | −362.4 ± 47 | 0.272 | 0.76 | 100% | 72 | 3.1° |
+
+(`runs/ent_{global,state}_t00_500ep/`; behavioral metrics from
+`scripts/policy_metrics.py`, 16 deterministic episodes per best
+checkpoint.)
+
+1. **All six arms solve CartPole** (100% swing-up, ~3° balance). The
+   entropy dose changes the *speed*, never the *outcome*, on this task.
+2. **The dose-response is task-dependent.** CartPole orders
+   t = 0.0 > t = −0.5 on the global arm (best AND last-5) and on the
+   state arm's best — the *opposite* of the pendulum's strict monotone.
+   The divide is the price of noise: CartPole's reward has no action
+   penalty and its 1000 N actuator never saturates, so noise is cheap;
+   the pendulum's swing-up is a timing-critical maneuver that noise
+   destroys.
+3. **α settles at a genuinely different operating point**, not a
+   rescaled one: t = 0.0 arms park at α ≈ 0.76–0.82 vs 0.23–0.24 at
+   t = −0.5, with σ ending 0.27–0.29 vs 0.14–0.16.
+4. **The headline conclusion survives but narrows**: the best entropy
+   arm (−298.5) still trails plain global (−274.0), gap 40 → 24 points
+   as the target widens. On CartPole the honest statement is "entropy
+   still costs, but less the wider the target"; on the pendulum it is
+   "entropy costs, and more the wider the target". Same objective, two
+   tasks, opposite gradients — the target is not a hyperparameter with
+   a universal sweet spot but a bet on how expensive exploration is on
+   the task at hand.
+
 ### Verdict
 
 At the paper budget on CartPole: **keep the official objective.** The
@@ -303,7 +349,9 @@ Three findings:
    mean is large; the cost is behavioral, not arithmetic.)
 3. **More target = worse, monotonically.** t = 0.0 (wider floor) is
    uniformly worse than t = −0.5 on both σ modes. There is no dose at
-   which the medicine helps in sight.
+   which the medicine helps in sight — and the CartPole cross-check
+   above shows this is a property of *this task*, not of the objective:
+   there the same comparison orders the *opposite* way.
 
 **Scope conclusion.** This is the SAPO regime failing: a dense-reward
 task where SHAC genuinely stalls in a local optimum, where entropy
@@ -325,6 +373,12 @@ uv run python -m shac.train --logdir runs/std_ent_state_500ep --seed 0 \
     --episodes 500 --device cpu --threads 1 --state-std --max-entropy
 uv run python -m shac.train --logdir runs/std_ent_global_500ep --seed 0 \
     --episodes 500 --device cpu --threads 1 --max-entropy
+
+# the raised-target cross-check (dose-response section)
+uv run python -m shac.train --logdir runs/ent_global_t00_500ep --seed 0 \
+    --episodes 500 --device cpu --threads 1 --max-entropy --entropy-target 0.0
+uv run python -m shac.train --logdir runs/ent_state_t00_500ep --seed 0 \
+    --episodes 500 --device cpu --threads 1 --state-std --max-entropy --entropy-target 0.0
 
 # the four-panel figure  -> figures/max_entropy_ab.png
 uv run python scripts/plot_max_entropy.py
@@ -349,5 +403,6 @@ uv run python tests/test_max_entropy.py
 ```
 
 Artifacts (gitignored `runs/`, regenerable above):
-`runs/std_ent_state_500ep/` and `runs/std_ent_global_500ep/` (log.csv,
+`runs/std_ent_state_500ep/`, `runs/std_ent_global_500ep/`,
+`runs/ent_global_t00_500ep/`, `runs/ent_state_t00_500ep/` (log.csv,
 checkpoints), the committed figure `figures/max_entropy_ab.png`.

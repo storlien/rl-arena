@@ -218,7 +218,11 @@ left (MAX_ENTROPY.md's interpretation 2); the pendulum genuinely has
 one — but its exploration is expensive (torque-taxed noise through a
 tanh-squashed 1-D action), and paying that premium everywhere to buy a
 few more top-region samples costs more than the samples return at this
-budget. Same practical conclusion, sharper mechanism.
+budget. Same practical conclusion, sharper mechanism — and the
+dose-response runs the *opposite* way on the two tasks: on CartPole,
+widening the target to 0.0 *helps* (MAX_ENTROPY.md's raised-target
+cross-check), here it strictly hurts. Exploration is cheap on one and
+expensive on the other.
 
 ### 5.3 Open levers (not yet run)
 
