@@ -41,9 +41,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import torch
 
-from shac.envs import make_env, make_env_config
-from shac.models.networks import GaussianActor
-from shac.utils.running_stats import RunningMeanStd
+from shac.envs import make_env
+from shac.utils.checkpoints import build_actor_and_rms, read_checkpoint
 
 UPRIGHT_RAD = 0.25     # within 14 deg of upright counts as "up"
 HOLD_STEPS = 10        # ... and it must hold for this many consecutive steps
@@ -59,13 +58,10 @@ SIN_COS_IDX = {
 
 
 def load_policy(path, device):
-    """Load a checkpoint -> (env_name, env_cfg, ckpt). The actor (whose
-    input size is an env property) and the obs normalizer are rebuilt by
-    the caller once the env exists."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    env_name = ckpt.get("env_name", "cartpole")   # pre-registry checkpoints
-    env_cfg = make_env_config(env_name, **ckpt["env_cfg"])
-    return env_name, env_cfg, ckpt
+    """Load a checkpoint -> (env_name, env_cfg, ckpt). The actor and the
+    obs normalizer are rebuilt by evaluate_checkpoint once the env exists
+    (shac.utils.checkpoints)."""
+    return read_checkpoint(path, device)
 
 
 @torch.no_grad()
@@ -74,23 +70,15 @@ def evaluate_checkpoint(path, device, num_episodes, seed):
     torch.manual_seed(seed)
     env_name, env_cfg, ckpt = load_policy(path, device)
     env = make_env(env_name, env_cfg, device, num_envs=num_episodes)
-
-    actor = GaussianActor(env.num_obs, env.num_actions,
-                          tuple(ckpt["algo_cfg"]["actor_units"]),
-                          ckpt["algo_cfg"]["actor_logstd_init"],
-                          state_std=ckpt["algo_cfg"].get(
-                              "actor_state_std", False)).to(device)
-    actor.load_state_dict(ckpt["actor"])
-    actor.eval()
-    rms = None
-    if ckpt["obs_rms"] is not None:
-        rms = RunningMeanStd((env.num_obs,), device=device)
-        rms.load_state_dict(ckpt["obs_rms"])
+    actor, rms = build_actor_and_rms(ckpt, env, device)
 
     sin_i, cos_i = SIN_COS_IDX[env_name]
     obs = env.reset()
     returns = torch.zeros(num_episodes, device=device)
     thetas = []                      # |theta| per step, [T, num_episodes]
+    # Exactly H steps per episode: correct for the current envs (no early
+    # termination), unlike SHACTrainer.evaluate which also handles tasks
+    # that can end early. If such an env is added, revisit this loop.
     for _ in range(env.episode_length):
         o = rms.normalize(obs) if rms is not None else obs
         action = torch.tanh(actor(o, deterministic=True))
@@ -104,8 +92,10 @@ def evaluate_checkpoint(path, device, num_episodes, seed):
     up = abs_theta < UPRIGHT_RAD                       # [T, E]
 
     # first step of a >=HOLD_STEPS consecutive upright streak, per episode
-    hold = torch.zeros(E, dtype=torch.long)
-    first_upright = torch.full((E,), -1, dtype=torch.long)
+    # (all state tensors on `env.device` -- a CPU/device mix here would
+    # crash on CUDA while working fine on CPU)
+    hold = torch.zeros(E, dtype=torch.long, device=device)
+    first_upright = torch.full((E,), -1, dtype=torch.long, device=device)
     for t in range(T):
         hold = torch.where(up[t], hold + 1, torch.zeros_like(hold))
         newly = (hold >= HOLD_STEPS) & (first_upright < 0)

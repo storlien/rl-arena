@@ -48,6 +48,7 @@ progresses); both views carry the same information.
 import argparse
 import csv
 import json
+import math
 import os
 import statistics
 import sys
@@ -55,6 +56,21 @@ import sys
 import matplotlib
 matplotlib.use("Agg")           # headless-safe (works over SSH)
 import matplotlib.pyplot as plt
+
+
+def hanging_baseline(logdir: str) -> float:
+    """The do-nothing baseline return: hanging still scores -pi^2 per step
+    for BOTH envs' wrapped-angle rewards, so the episode baseline is
+    -pi^2 * H with H the task horizon. Read from the run's metadata.json
+    (falling back to H = 240) so the reference line follows each run's env
+    instead of a hardcoded constant."""
+    H = 240
+    try:
+        with open(os.path.join(logdir, "metadata.json")) as f:
+            H = int(json.load(f)["env"]["episode_length"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return -math.pi ** 2 * H, H
 
 
 def load_log(logdir: str):
@@ -130,6 +146,7 @@ def main():
     args = p.parse_args()
 
     rows = load_log(args.logdir)
+    baseline, baseline_H = hanging_baseline(args.logdir)
     window = args.smooth
     if window < 0:                          # auto: ~4% of the run
         window = max(5, len(rows) // 25)
@@ -185,8 +202,8 @@ def main():
         ax.fill_between(ex, [m - s for m, s in zip(em, es)],
                         [m + s for m, s in zip(em, es)],
                         alpha=0.2, color="C1", lw=0)
-    ax.axhline(-2369, color="gray", ls=":",
-               label="hanging still (-pi^2 * 240 = -2369)")
+    ax.axhline(baseline, color="gray", ls=":",
+               label=f"hanging still (-pi^2 * {baseline_H} = {baseline:.0f})")
     ax.axhline(0.0, color="green", ls=":", alpha=0.7, label="perfect (0)")
     ax.set_xlabel("simulation steps ($\\times 10^5$)")
     ax.set_ylabel("episode return  (higher = better)")
@@ -197,18 +214,18 @@ def main():
     # ---------------- (2) return vs wall-clock time ----------------
     # The paper's Figure 4 bottom row: the same learning curve against
     # wall-clock training time instead of samples.
-    ax = axes[1]
+    ax2 = axes[1]
     wx, wm = masked(wall_min, ev_ms)
     if wm:
-        ax.plot(wx, wm, color="C1", lw=2)
-    ax.axhline(-2369, color="gray", ls=":")
-    # The eval curve stays far above the -2369 reference, so autoscale
+        ax2.plot(wx, wm, color="C1", lw=2)
+    ax2.axhline(baseline, color="gray", ls=":")
+    # The eval curve stays far above the baseline reference, so autoscale
     # would leave it flush with the frame; add breathing room below it.
-    ax.margins(y=0.12)
-    ax.set_xlabel("wall-clock time (min)")
-    ax.set_ylabel("eval episode return")
-    ax.set_title("Return vs wall-clock time (cf. paper Fig. 4 bottom)")
-    ax.grid(alpha=0.3)
+    ax2.margins(y=0.12)
+    ax2.set_xlabel("wall-clock time (min)")
+    ax2.set_ylabel("eval episode return")
+    ax2.set_title("Return vs wall-clock time (cf. paper Fig. 4 bottom)")
+    ax2.grid(alpha=0.3)
 
     # ---------------- (3) losses ----------------
     ax = axes[2]

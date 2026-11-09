@@ -33,19 +33,15 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 import torch
 
 from shac.envs import make_env, make_env_config
-from shac.models.networks import GaussianActor
-from shac.utils.running_stats import RunningMeanStd
+from shac.utils.checkpoints import build_actor_and_rms, read_checkpoint
 
 
 def load_policy(path, device):
     """Load a checkpoint -> (env_name, env_cfg, ckpt).
 
     The actor (whose input size is an env property) and the obs normalizer
-    are rebuilt in main() once the env exists."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    env_name = ckpt.get("env_name", "cartpole")   # pre-registry checkpoints
-    env_cfg = make_env_config(env_name, **ckpt["env_cfg"])
-    return env_name, env_cfg, ckpt
+    are rebuilt in main() once the env exists (shac.utils.checkpoints)."""
+    return read_checkpoint(path, device)
 
 
 @torch.no_grad()
@@ -146,22 +142,16 @@ def main():
     env = make_env(env_name, env_cfg, device)
 
     # Actor shape follows the env (cartpole obs = 5, pendulum obs = 3).
-    actor = GaussianActor(env.num_obs, env.num_actions,
-                          tuple(ckpt["algo_cfg"]["actor_units"]),
-                          ckpt["algo_cfg"]["actor_logstd_init"],
-                          state_std=ckpt["algo_cfg"].get(
-                              "actor_state_std", False)).to(device)
-    actor.load_state_dict(ckpt["actor"])
-    actor.eval()
-    rms = None
-    if ckpt["obs_rms"] is not None:
-        rms = RunningMeanStd((env.num_obs,), device=device)
-        rms.load_state_dict(ckpt["obs_rms"])
+    actor, rms = build_actor_and_rms(ckpt, env, device)
 
     frames, rewards, total = rollout(env, actor, rms,
                                      deterministic=not args.stochastic)
-    print(f"episode return: {total:.1f}  (hanging-still baseline = -2369, "
-          f"perfect ~ 0; closer to 0 = better)")
+    # The do-nothing baseline: hanging still scores -pi^2 per step for BOTH
+    # envs' wrapped-angle rewards (derived, not hardcoded, so it follows
+    # each run's task horizon).
+    baseline = -math.pi ** 2 * env.episode_length
+    print(f"episode return: {total:.1f}  (hanging-still baseline = "
+          f"{baseline:.0f}, perfect ~ 0; closer to 0 = better)")
 
     stem = os.path.splitext(args.checkpoint)[0]
     gif_path = args.gif or stem + "_rollout.gif"

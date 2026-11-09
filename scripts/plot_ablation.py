@@ -120,6 +120,10 @@ def main():
               f"wall {wt[-1]:5.1f} min")
 
     for a in (ax, ax2):
+        # -2369 = -pi^2 * 240: this script is specific to the CartPole
+        # ablation matrix (see ARMS above), whose hanging-still baseline is
+        # -pi^2 per step over H = 240 steps. (plot_training.py derives the
+        # same quantity from each run's metadata; here the task is fixed.)
         a.axhline(-2369, color="gray", ls=":", lw=1)
         a.axhline(0, color="green", ls=":", lw=1)
         a.set_ylabel("deterministic eval return")

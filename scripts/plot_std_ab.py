@@ -38,26 +38,45 @@ from matplotlib.colors import LogNorm
 
 from plot_training import load_log, col, masked
 
-from shac.models.networks import GaussianActor
-from shac.utils.running_stats import RunningMeanStd
+from shac.envs import make_env
+from shac.utils.checkpoints import build_actor_and_rms, read_checkpoint
 
 C_G, C_S = "C0", "C3"          # global = blue, state = red
 
 
 def load_policy(run, suffix="best_policy"):
-    """Rebuild the actor exactly as the checkpoint was trained (state_std
-    flag comes from the algo_cfg metadata, like render_policy.py)."""
-    ckpt = torch.load(os.path.join(run, f"{suffix}.pt"), map_location="cpu",
-                      weights_only=False)
-    algo = ckpt["algo_cfg"]
-    actor = GaussianActor(5, 1, tuple(algo["actor_units"]),
-                          algo["actor_logstd_init"],
-                          state_std=algo.get("actor_state_std", False))
-    actor.load_state_dict(ckpt["actor"])
-    actor.eval()
-    rms = RunningMeanStd((5,), device="cpu")
-    rms.load_state_dict(ckpt["obs_rms"])
-    return actor, rms
+    """Rebuild the actor + obs normalizer exactly as the checkpoint was
+    trained. The env (and thus actor input size and normalizer shape) comes
+    from the checkpoint's env_name via the registry; the state_std flag
+    from the algo_cfg metadata."""
+    env_name, env_cfg, ckpt = read_checkpoint(os.path.join(run, f"{suffix}.pt"),
+                                              "cpu")
+    env = make_env(env_name, env_cfg, torch.device("cpu"))
+    actor, rms = build_actor_and_rms(ckpt, env, "cpu")
+    return actor, rms, env_name
+
+
+def sigma_grid(env_name):
+    """Observation grid over the (theta, theta_dot) plane for panel (c).
+
+    The observation layouts differ per env (cartpole: [x, x_dot, sin, cos,
+    theta_dot] with the cart parked at x = x_dot = 0; pendulum:
+    [cos, sin, theta_dot]), so the grid builder is dispatched on env_name.
+    Returns (obs [n*n, obs_dim], TH, THD) with TH in [0, 2pi] x THD in
+    [-6, 6] rad/s.
+    """
+    th = torch.linspace(0, 2 * math.pi, 121)
+    thd = torch.linspace(-6, 6, 61)
+    TH, THD = torch.meshgrid(th, thd, indexing="ij")
+    if env_name == "cartpole":
+        obs = torch.stack([torch.zeros_like(TH).reshape(-1),
+                           torch.zeros_like(TH).reshape(-1),
+                           TH.sin().reshape(-1), TH.cos().reshape(-1),
+                           THD.reshape(-1)], dim=1)
+    else:                                   # pendulum
+        obs = torch.stack([TH.cos().reshape(-1), TH.sin().reshape(-1),
+                           THD.reshape(-1)], dim=1)
+    return obs, TH, THD
 
 
 def main():
@@ -116,17 +135,14 @@ def main():
 
     # ---------- (c) learned sigma(s) over (theta, theta_dot) ---------------
     ax = axes[1, 0]
-    actor, rms = load_policy(args.state_run)
-    th = torch.linspace(0, 2 * math.pi, 121)
-    thd = torch.linspace(-6, 6, 61)
-    TH, THD = torch.meshgrid(th, thd, indexing="ij")
-    grid = torch.stack([torch.zeros_like(TH).reshape(-1),
-                       torch.zeros_like(TH).reshape(-1),
-                       TH.sin().reshape(-1), TH.cos().reshape(-1),
-                       THD.reshape(-1)], dim=1)
+    actor, rms, env_name = load_policy(args.state_run)
+    grid, TH, THD = sigma_grid(env_name)
+    # The meshgrid axes for plotting: theta on y, theta_dot on x.
+    th = torch.linspace(0, 2 * math.pi, TH.shape[0])
+    thd = torch.linspace(-6, 6, THD.shape[1])
     with torch.no_grad():
         sg = actor.mu_sigma(rms.normalize(grid))[1].reshape(TH.shape)
-    actor_g, rms_g = load_policy(args.global_run)
+    actor_g, rms_g, _ = load_policy(args.global_run)
     with torch.no_grad():
         sg_g = actor_g.mu_sigma(rms_g.normalize(grid))[1].reshape(TH.shape)
     # vmax includes the global constant so its contour renders INSIDE the
