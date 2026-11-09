@@ -111,6 +111,31 @@ def parse_args() -> argparse.Namespace:
                         "window loss when --critic-ensemble > 1: 'min' "
                         "(pessimistic) or 'avg' (SAPO's paper: average in "
                         "the actor return, min only for critic targets)")
+    p.add_argument("--init-mode", default="hanging",
+                   choices=["hanging", "uniform", "upright"],
+                   help="PENDULUM ONLY: initial-state distribution -- "
+                        "'hanging' (repo convention, every episode a "
+                        "genuine swing-up), 'uniform' (gym-faithful: "
+                        "theta ~ U(-pi, pi), omega ~ U(-1, 1) -- a "
+                        "built-in balance curriculum), or 'upright' "
+                        "(near-upright balance-only curriculum)")
+    p.add_argument("--energy-shaping", type=float, default=0.0, metavar="W",
+                   help="PENDULUM ONLY: energy-shaping reward penalty "
+                        "weight w in r -= w*((E - E*)/(2 m g l))^2 "
+                        "(E* = m g l upright at rest); 0 = gym reward "
+                        "exactly. Prices energy near the separatrix so "
+                        "the orbit policy gets a gradient toward "
+                        "arriving slow")
+    p.add_argument("--actor-logstd-init", type=float, default=-1.0,
+                   metavar="S",
+                   help="initial log-std of the policy (default -1.0 -> "
+                        "sigma0 = 0.37, paper). Higher = wider initial "
+                        "exploration, e.g. 0.0 -> sigma0 = 1.0")
+    p.add_argument("--ep-length", type=int, default=None, metavar="H",
+                   help="override the TASK horizon H (episode_length; "
+                        "default = the env's paper/gym value, 240 for both "
+                        "tasks). PENDULUM: H=480 approximates gym's "
+                        "10 s clock at this repo's dt=1/60")
     p.add_argument("--state-std", action="store_true",
                    help="experimental A/B: SAC-style STATE-DEPENDENT policy "
                         "std (the paper's sigma_theta(s) notation) -- the "
@@ -177,6 +202,11 @@ def main() -> None:
 
     # ---- assemble configuration from CLI overrides -----------------------
     env_cfg = make_env_config(args.env, num_envs=args.num_envs)
+    if args.env == "pendulum":
+        env_cfg.init_mode = args.init_mode
+        env_cfg.energy_shaping = args.energy_shaping
+    if args.ep_length is not None:
+        env_cfg.episode_length = args.ep_length
     algo_cfg = SHACConfig(
         short_horizon=args.horizon,
         num_episodes=args.episodes,
@@ -187,6 +217,7 @@ def main() -> None:
         target_critic_alpha=args.target_alpha,
         use_critic=not args.no_critic,
         actor_state_std=args.state_std,
+        actor_logstd_init=args.actor_logstd_init,
         max_entropy=args.max_entropy,
         entropy_target=args.entropy_target,
         entropy_lr=args.entropy_lr,

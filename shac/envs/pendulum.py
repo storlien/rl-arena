@@ -185,13 +185,31 @@ class PendulumSwingUpEnv(DifferentiableEnv):
         smooth differentiable function of the state and action
         (paper: "reward formulations ... are defined as differentiable
         functions"). Its maximum (~0) is attained balanced upright with
-        zero torque."""
+        zero torque.
+
+        With cfg.energy_shaping = w > 0, an energy-shaping penalty is
+        subtracted additionally:
+            r -= w * ((E - E*) / (2 m g l))^2
+        E = 0.5*I*omega^2 + m g l cos(theta) (total mechanical energy, I
+        about the pivot), E* = m g l (upright at rest). See
+        SHACConfig/PendulumEnvConfig.energy_shaping for the rationale."""
         theta = q[:, 0]
         thd = qd[:, 0]
         theta_n = torch.atan2(torch.sin(theta), torch.cos(theta))
-        return -(theta_n.square()
-                 + thd.square() * 0.1
-                 + torque.square() * 0.001)
+        r = -(theta_n.square()
+              + thd.square() * 0.1
+              + torque.square() * 0.001)
+        w = self.cfg.energy_shaping
+        if w > 0.0:
+            m = self.cfg.link_mass
+            l = self.cfg.link_com_distance
+            I = self.cfg.link_inertia_com + m * l * l
+            g = self.cfg.gravity
+            E = 0.5 * I * thd.square() + m * g * l * torch.cos(theta)
+            E_star = m * g * l
+            deficit = 2.0 * m * g * l
+            r = r - w * ((E - E_star) / deficit).square()
+        return r
 
     # ==================================================================
     # Environment API
@@ -199,20 +217,45 @@ class PendulumSwingUpEnv(DifferentiableEnv):
     def _initial_states(self, n: int):
         """Draw n initial states from the initial-state distribution.
 
-        CartPole-style (this repo's convention, NOT gym's uniform): fixed
-          pose (theta = -pi hanging, at rest) plus uniform noise:
+        cfg.init_mode selects the distribution:
+
+        "hanging" (default) -- CartPole-style (this repo's convention, NOT
+          gym's uniform): fixed pose (theta = -pi hanging, at rest) plus
+          uniform noise:
           theta     += (pi/2) * (U[0,1] - 0.5)   -> theta in [-3pi/2, -pi/2]
           theta_dot += 0.25   * (U[0,1] - 0.5)   -> in [-0.125, 0.125]
-        i.e. the same relative spread as the CartPole (positions noise
-        +/-pi/2 around the fixed pose, velocity noise +/-0.25), so every
-        episode is a genuine swing-up from (near) the hanging position."""
+          i.e. the same relative spread as the CartPole (positions noise
+          +/-pi/2 around the fixed pose, velocity noise +/-0.25), so every
+          episode is a genuine swing-up from (near) the hanging position.
+
+        "upright" -- near-upright curriculum: theta ~ U(-pi/4, pi/4),
+          theta_dot ~ U(-0.5, 0.5). Densely samples the ~11.5-deg capture
+          basin (plus recoverable excursions) so the balancing skill gets
+          gradient signal that the hanging-init plateau never provides.
+
+        "uniform" -- gym-faithful Pendulum-v1: theta ~ U(-pi, pi),
+          theta_dot ~ U(-1, 1) over the WHOLE circle. A built-in
+          curriculum: basin-start episodes teach balancing, far-start
+          episodes still demand the pump-up.
+        """
         q0 = self._init_q.unsqueeze(0).expand(n, 1).clone()
         qd0 = self._init_qd.unsqueeze(0).expand(n, 1).clone()
         if self.cfg.stochastic_init:
-            q0 = q0 + (math.pi / 2) * (torch.rand(n, 1, dtype=self.dtype,
-                                                  device=self.device) - 0.5)
-            qd0 = qd0 + 0.25 * (torch.rand(n, 1, dtype=self.dtype,
-                                           device=self.device) - 0.5)
+            if self.cfg.init_mode == "hanging":
+                q0 = q0 + (math.pi / 2) * (torch.rand(n, 1, dtype=self.dtype,
+                                                      device=self.device) - 0.5)
+                qd0 = qd0 + 0.25 * (torch.rand(n, 1, dtype=self.dtype,
+                                               device=self.device) - 0.5)
+            elif self.cfg.init_mode == "uniform":
+                q0 = (2 * math.pi) * torch.rand(n, 1, dtype=self.dtype,
+                                                device=self.device) - math.pi
+                qd0 = 2.0 * (torch.rand(n, 1, dtype=self.dtype,
+                                        device=self.device) - 0.5)
+            else:      # upright: theta ~ U(-pi/4, pi/4), omega ~ U(-0.5, 0.5)
+                q0 = (math.pi / 2) * (torch.rand(n, 1, dtype=self.dtype,
+                                                 device=self.device) - 0.5)
+                qd0 = 1.0 * (torch.rand(n, 1, dtype=self.dtype,
+                                        device=self.device) - 0.5)
         return q0, qd0
 
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:

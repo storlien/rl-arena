@@ -193,10 +193,37 @@ class PendulumEnvConfig(EnvConfigBase):
     # the pendulum actuator to +/- 2 N m, so a saturated action == maximum
     # admissible torque.
 
+    # --- experiment switches (anti-plateau arms; defaults = gym-faithful) ---
+    init_mode: str = "hanging"
+    # "hanging" (default): fixed hanging pose + uniform noise, theta in
+    # [-3pi/2, -pi/2] -- every episode is a genuine swing-up (the repo's
+    # CartPole-style convention). "uniform": GYM-FAITHFUL Pendulum-v1 init
+    # -- theta ~ U(-pi, pi), theta_dot ~ U(-1, 1) over the WHOLE circle.
+    # Every episode that starts within/near the ~11.5-deg capture basin
+    # gives the balancing skill dense gradient (a built-in curriculum),
+    # while far starts still require the pump. "upright": near-upright
+    # curriculum -- theta ~ U(-pi/4, pi/4), theta_dot ~ U(-0.5, 0.5);
+    # balance-only (used for the two-stage probe). NOTE: evals use the
+    # same distribution, so returns are NOT comparable across init modes.
+    energy_shaping: float = 0.0
+    # Optional energy-shaping bonus on top of the gym reward:
+    #   r -= w * ((E - E*) / (2 m g l))^2
+    # with E = 0.5*I*theta_dot^2 + m g l cos(theta) (I about the pivot) and
+    # E* = m g l (upright at rest). The normalizer 2 m g l = the full
+    # hanging->upright energy deficit, so the penalty is O(w) across the
+    # whole reachable state space. Zero (default) = the gym reward exactly.
+    # Rationale (PENDULUM.md 5.3): the orbit policy passes the top with too
+    # much energy to capture; this prices ENERGY near the separatrix E*
+    # regardless of angle, so both the pump-up (from below) and the
+    # arrival-speed (from above) get a gradient.
+
     def __post_init__(self):
         super().__post_init__()
         assert self.link_mass > 0
         assert self.action_strength > 0
+        if self.init_mode not in ("hanging", "uniform", "upright"):
+            raise ValueError("unknown init_mode "
+                             f"'{self.init_mode}' (hanging | uniform | upright)")
 
 
 # ---------------------------------------------------------------------------
