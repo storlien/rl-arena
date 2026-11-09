@@ -135,7 +135,13 @@ class PendulumSwingUpEnv(DifferentiableEnv):
     # ==================================================================
     def _accelerations(self, q: torch.Tensor, qd: torch.Tensor,
                        torque: torch.Tensor) -> torch.Tensor:
-        """Equation of motion (1): theta_ddot = (u - m*g*l*sin(theta)) / I.
+        """Equation of motion (1): theta_ddot = (u + m*g*l*sin(theta)) / I.
+
+        (PLUS sign on the gravity term -- theta is measured from upright,
+        so gravity drives the link away from upright and restores it
+        toward hanging. See the module docstring for the derivation and
+        the sign checks; the tests pin this against energy conservation
+        and the equilibria.)
 
         q, qd:   [N, 1] generalized position/velocity
         torque:  [N]    torque applied at the pivot [N m]
@@ -183,9 +189,9 @@ class PendulumSwingUpEnv(DifferentiableEnv):
         theta = q[:, 0]
         thd = qd[:, 0]
         theta_n = torch.atan2(torch.sin(theta), torch.cos(theta))
-        return (-(theta_n.square() * 1.0
-                  + thd.square() * 0.1
-                  + torque.square() * 0.001))
+        return -(theta_n.square()
+                 + thd.square() * 0.1
+                 + torque.square() * 0.001)
 
     # ==================================================================
     # Environment API

@@ -1,14 +1,20 @@
 """
-Configuration for the SHAC CartPole Swing-Up experiment.
+Configuration for the SHAC experiments.
 
 Every default below is taken from either the paper (tables referenced in the
-comments) or the authors' released configuration file for this exact task:
+comments) or the authors' released configuration file for the CartPole task:
 
     NVlabs/DiffRL: examples/cfg/shac/cartpole_swing_up.yaml
 
 so that training here reproduces the paper's CartPole experiment as closely
 as possible. Where the paper and the released code differ (or the paper is
 silent), the comment explains the choice.
+
+Structure: `EnvConfigBase` holds the simulation conventions every
+environment shares; each concrete env config (`EnvConfig` = CartPole,
+`PendulumEnvConfig`) subclasses it and adds its own physical/task
+parameters. The env registry in shac/envs/__init__.py pairs each env NAME
+with its class and config type.
 """
 
 from dataclasses import dataclass, field
@@ -16,10 +22,57 @@ from typing import Tuple, Optional
 
 
 # ---------------------------------------------------------------------------
+# Shared environment-config base (simulation conventions all envs share)
+# ---------------------------------------------------------------------------
+@dataclass
+class EnvConfigBase:
+    """The repo's SIMULATION conventions, shared by every environment.
+
+    Concrete env configs (CartPole's `EnvConfig`, the Pendulum's
+    `PendulumEnvConfig`) subclass this and add their physical/task
+    parameters. The fields stay separate per env on purpose -- each env's
+    docstring documents its own choices -- but the shared conventions are
+    defined (and type-checked by the trainer) exactly once here.
+    """
+
+    # --- parallel environments -------------------------------------------
+    num_envs: int = 64
+    # Number of environments simulated in parallel (paper Table 4: N = 64).
+    # This is "N" in the paper's equations.
+
+    episode_length: int = 240
+    # Task horizon H (steps). The environment resets after this many steps.
+    # Note: this is NOT the SHAC short horizon h.
+
+    # --- time discretization ----------------------------------------------
+    dt: float = 1.0 / 60.0
+    # Duration of one policy step in seconds (official env: 1/60 s, i.e.
+    # the policy runs at 60 Hz).
+    sim_substeps: int = 4
+    # Physics sub-integration steps per policy step (official env: 4).
+    # Each substep integrates dt/4 = 1/240 s with semi-implicit Euler
+    # (paper Section 3.1: "semi-implicit Euler integration").
+
+    # --- initial state distribution ------------------------------------------
+    stochastic_init: bool = True
+    # Noise on the fixed initial pose. The exact spread is per-env (each
+    # env's docstring documents its own).
+
+    # --- misc ----------------------------------------------------------------
+    dtype: str = "float32"
+    # Float precision used inside the simulator. float32 matches the
+    # official implementation; tests switch to float64 for tight tolerances.
+
+    def __post_init__(self):
+        assert self.num_envs >= 1
+        assert self.episode_length > 0
+
+
+# ---------------------------------------------------------------------------
 # Environment: CartPole Swing-Up (paper Appendix A.3.1)
 # ---------------------------------------------------------------------------
 @dataclass
-class EnvConfig:
+class EnvConfig(EnvConfigBase):
     """CartPole Swing-Up environment parameters.
 
     Observation (paper Table 6), 5 values:
@@ -34,25 +87,14 @@ class EnvConfig:
     Reward (paper Eq. 13):
         R = -theta^2 - 0.1 * theta_dot^2 - 0.05 * x^2 - 0.1 * x_dot^2
         (always <= 0; a perfectly balanced pole earns ~0 per step)
+
+    Initial state (official env; gated by `stochastic_init`): every reset
+    starts from the fixed pose (x=0, theta=-pi, i.e. pole hanging straight
+    down) plus uniform noise:
+        joint positions  += pi  * (U[0,1] - 0.5)  -> x in [-pi/2, pi/2],
+                                                     theta in [-3pi/2, -pi/2]
+        joint velocities += 0.5 * (U[0,1] - 0.5)  -> each in [-0.25, 0.25]
     """
-
-    # --- parallel environments -------------------------------------------
-    num_envs: int = 64
-    # Number of environments simulated in parallel (paper Table 4: N = 64).
-    # This is "N" in the paper's equations.
-
-    episode_length: int = 240
-    # Task horizon H (paper A.3.1: H = 240 steps). The environment resets
-    # after this many steps. Note: this is NOT the SHAC short horizon h.
-
-    # --- time discretization ----------------------------------------------
-    dt: float = 1.0 / 60.0
-    # Duration of one policy step in seconds (official env: 1/60 s, i.e.
-    # the policy runs at 60 Hz).
-    sim_substeps: int = 4
-    # Physics sub-integration steps per policy step (official env: 4).
-    # Each substep integrates dt/4 = 1/240 s with semi-implicit Euler
-    # (paper Section 3.1: "semi-implicit Euler integration").
 
     # --- physical parameters ------------------------------------------------
     # These come from the official dflex cartpole URDF asset
@@ -80,33 +122,16 @@ class EnvConfig:
     # The limit force is essentially never active for reasonable policies
     # (the reward already penalizes |x|), but it keeps simulations bounded.
 
-    # --- initial state distribution ------------------------------------------
-    stochastic_init: bool = True
-    # Official env: every reset starts from the fixed pose (x=0, theta=-pi,
-    # i.e. pole hanging straight down) plus uniform noise:
-    #   joint positions += pi   * (U[0,1] - 0.5)   -> x in [-pi/2, pi/2],
-    #                                                 theta in [-3pi/2, -pi/2]
-    #   joint velocities += 0.5 * (U[0,1] - 0.5)  -> each velocity in [-0.25, 0.25]
-
     early_termination: bool = False
     # CartPole Swing-Up has NO early termination (paper A.3.1), unlike e.g.
     # Hopper/Ant. Environments only reset at the task horizon H=240.
-
-    # --- misc ----------------------------------------------------------------
-    dtype: str = "float32"
-    # Float precision used inside the simulator. float32 matches the
-    # official implementation; tests switch to float64 for tight tolerances.
-
-    def __post_init__(self):
-        assert self.num_envs >= 1
-        assert self.episode_length > 0
 
 
 # ---------------------------------------------------------------------------
 # Environment: Pendulum Swing-Up (NOT in the SHAC paper -- second task)
 # ---------------------------------------------------------------------------
 @dataclass
-class PendulumEnvConfig:
+class PendulumEnvConfig(EnvConfigBase):
     """Pendulum Swing-Up environment parameters.
 
     The SHAC paper does not include a pendulum task, so the TASK spec
@@ -128,6 +153,13 @@ class PendulumEnvConfig:
         R = -theta^2 - 0.1 * theta_dot^2 - 0.001 * u^2
         (always <= 0; a perfectly balanced, torque-free pendulum earns ~0
         per step; u is the PHYSICAL torque in N m)
+
+    Initial state (CartPole-style, NOT gym's uniform-over-the-circle; gated
+    by `stochastic_init`): every reset starts from the fixed pose
+    (theta = -pi hanging, at rest) plus uniform noise with the same relative
+    spread as the CartPole:
+        theta     += (pi/2) * (U[0,1] - 0.5)  -> theta in [-3pi/2, -pi/2]
+        theta_dot += 0.25   * (U[0,1] - 0.5)  -> in [-0.125, 0.125]
     """
 
     # --- parallel environments -------------------------------------------
@@ -161,22 +193,8 @@ class PendulumEnvConfig:
     # the pendulum actuator to +/- 2 N m, so a saturated action == maximum
     # admissible torque.
 
-    # --- initial state distribution ------------------------------------------
-    stochastic_init: bool = True
-    # CartPole-style noise (NOT gym's uniform-over-the-circle init): every
-    # reset starts from the fixed pose (theta = -pi hanging, at rest) plus
-    # uniform noise with the same relative spread as the CartPole:
-    #   theta     += (pi/2) * (U[0,1] - 0.5)  -> theta in [-3pi/2, -pi/2]
-    #   theta_dot += 0.25   * (U[0,1] - 0.5)  -> in [-0.125, 0.125]
-
-    # --- misc ----------------------------------------------------------------
-    dtype: str = "float32"
-    # Float precision used inside the simulator. float32 matches the
-    # official implementation; tests switch to float64 for tight tolerances.
-
     def __post_init__(self):
-        assert self.num_envs >= 1
-        assert self.episode_length > 0
+        super().__post_init__()
         assert self.link_mass > 0
         assert self.action_strength > 0
 
@@ -321,6 +339,10 @@ class RunConfig:
     # "auto" | "cpu" | "cuda" | "cuda:0" ... The whole implementation is
     # device-agnostic; CPU is plenty fast for CartPole at N=64 (the parallel
     # env is a handful of small tensor ops), GPU pays off at larger N.
+    # NOTE: this field is the RECORD of the device a run used -- train.py
+    # resolves "auto" to a concrete torch.device, passes that to the trainer
+    # directly, and stores the resolution back here for metadata.json /
+    # checkpoints. The trainer takes the torch.device, not this string.
 
     logdir: Optional[str] = None     # None -> runs/cartpole_<date>_<time>
     eval_interval: int = 10         # evaluate every k learning episodes
