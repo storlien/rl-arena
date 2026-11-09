@@ -155,7 +155,14 @@ def main():
     # full-width axis for the gradient-estimator panel.
     axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]),
             fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])]
-    fig.suptitle("SHAC on CartPole Swing-Up", fontsize=14)
+    env_label = "CartPole Swing-Up"
+    try:
+        with open(os.path.join(args.logdir, "metadata.json")) as f:
+            env_label = json.load(f).get("env_name", env_label) \
+                + " Swing-Up"
+    except (OSError, ValueError, TypeError):
+        pass
+    fig.suptitle(f"SHAC on {env_label}", fontsize=14)
 
     # ---------------- (1) return vs simulation steps ----------------
     ax = axes[0]
