@@ -103,6 +103,85 @@ class EnvConfig:
 
 
 # ---------------------------------------------------------------------------
+# Environment: Pendulum Swing-Up (NOT in the SHAC paper -- second task)
+# ---------------------------------------------------------------------------
+@dataclass
+class PendulumEnvConfig:
+    """Pendulum Swing-Up environment parameters.
+
+    The SHAC paper does not include a pendulum task, so the TASK spec
+    follows the classic Gym "Pendulum-v1" conventions (observation, reward,
+    physical parameters, torque limit) while the SIMULATION spec follows
+    this repo's CartPole conventions (semi-implicit Euler, dt, substeps,
+    horizon, initial-state noise). See PENDULUM.md for the full rationale
+    and the list of deliberate divergences from gym.
+
+    Observation (3 values):
+        [cos(theta), sin(theta), theta_dot]     (theta = 0 is UPRIGHT)
+
+    Action (1 value):
+        torque applied at the pivot. The raw action is squashed to (-1, 1)
+        (tanh in the trainer, clip here as a safety net) and multiplied by
+        `action_strength` to get the applied torque in Newton-meters.
+
+    Reward (Gym Pendulum-v1):
+        R = -theta^2 - 0.1 * theta_dot^2 - 0.001 * u^2
+        (always <= 0; a perfectly balanced, torque-free pendulum earns ~0
+        per step; u is the PHYSICAL torque in N m)
+    """
+
+    # --- parallel environments -------------------------------------------
+    num_envs: int = 64
+    # Number of environments simulated in parallel (same N as CartPole).
+
+    episode_length: int = 240
+    # Task horizon H (steps), matching the CartPole's 240 rather than gym's
+    # 200. The environment resets after this many steps. Note: this is NOT
+    # the SHAC short horizon h.
+
+    # --- time discretization ----------------------------------------------
+    dt: float = 1.0 / 60.0
+    # Duration of one policy step in seconds (repo convention; gym uses
+    # 0.05 s with RK4).
+    sim_substeps: int = 4
+    # Physics sub-integration steps per policy step (repo convention).
+    # Each substep integrates dt/4 = 1/240 s with semi-implicit Euler.
+
+    # --- physical parameters ------------------------------------------------
+    # Gym Pendulum-v1 defaults: a point-mass link, m = 1 kg, COM 1 m from
+    # the pivot, no rotational inertia about its own COM
+    #   -> inertia about the pivot: I = 0 + 1 * 1^2 = 1 kg m^2
+    link_mass: float = 1.0
+    link_com_distance: float = 1.0    # l: distance pivot -> link COM [m]
+    link_inertia_com: float = 0.0     # I_com: link inertia about its COM
+    gravity: float = 9.81             # m / s^2
+
+    action_strength: float = 2.0
+    # Torque scale: applied_torque = action_strength * action. Gym limits
+    # the pendulum actuator to +/- 2 N m, so a saturated action == maximum
+    # admissible torque.
+
+    # --- initial state distribution ------------------------------------------
+    stochastic_init: bool = True
+    # CartPole-style noise (NOT gym's uniform-over-the-circle init): every
+    # reset starts from the fixed pose (theta = -pi hanging, at rest) plus
+    # uniform noise with the same relative spread as the CartPole:
+    #   theta     += (pi/2) * (U[0,1] - 0.5)  -> theta in [-3pi/2, -pi/2]
+    #   theta_dot += 0.25   * (U[0,1] - 0.5)  -> in [-0.125, 0.125]
+
+    # --- misc ----------------------------------------------------------------
+    dtype: str = "float32"
+    # Float precision used inside the simulator. float32 matches the
+    # official implementation; tests switch to float64 for tight tolerances.
+
+    def __post_init__(self):
+        assert self.num_envs >= 1
+        assert self.episode_length > 0
+        assert self.link_mass > 0
+        assert self.action_strength > 0
+
+
+# ---------------------------------------------------------------------------
 # SHAC algorithm hyperparameters (paper Tables 4 & 5, CartPole column,
 # cross-checked against the released cartpole_swing_up.yaml)
 # ---------------------------------------------------------------------------
