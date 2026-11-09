@@ -321,6 +321,8 @@ curriculum*: every episode starting in/near the capture basin
 balance skill dense gradient, while far starts still demand the pump.
 `--init-mode uniform` restores exactly gym's distribution:
 
+![The three initial-state distributions](figures/pendulum_init_distributions.png)
+
 | run (500 eps, H=240) | best | uniform-dist behavioral metrics |
 |---|---|---|
 | `pend_gyminit` seed 0 | −474.7 | 68.8% swing-up, t_up 95, **3.7°** balance |
