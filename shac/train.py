@@ -102,6 +102,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--optimizer", default="adam", choices=["adam", "adamw"],
                    help="optimizer for both networks (adamw = SAPO design "
                         "choice V; identical lr/betas, decoupled decay)")
+    p.add_argument("--grad-clip", type=float, default=1.0, metavar="C",
+                   help="actor gradient-norm clip (paper/official 1.0; "
+                        "SAPO design choice V uses 0.5)")
+    p.add_argument("--actor-bootstrap-pool", default="min",
+                   choices=["min", "avg"],
+                   help="how the critic ENSEMBLE is pooled in the actor's "
+                        "window loss when --critic-ensemble > 1: 'min' "
+                        "(pessimistic) or 'avg' (SAPO's paper: average in "
+                        "the actor return, min only for critic targets)")
     p.add_argument("--state-std", action="store_true",
                    help="experimental A/B: SAC-style STATE-DEPENDENT policy "
                         "std (the paper's sigma_theta(s) notation) -- the "
@@ -185,8 +194,10 @@ def main() -> None:
         critic_warmup=args.critic_warmup,
         critic_ensemble=args.critic_ensemble,
         use_target_critic=not args.no_target_critic,
+        actor_bootstrap_pool=args.actor_bootstrap_pool,
         activation=args.activation,
         optimizer=args.optimizer,
+        grad_norm_clip=args.grad_clip,
     )
     run_cfg = RunConfig(
         seed=args.seed,

@@ -251,10 +251,10 @@ class SHACConfig:
     # uses the much faster 0.2 (target moves 80% toward the critic each
     # episode). Keep 0.2 for CartPole.
 
-    # --- architecture / optimizer switches (SAPO choice V; ablation-only) ----
+    # --- architecture / optimizer switches (SAPO-inspired V; ablation-only) --
     activation: str = "elu"
     # Hidden-layer activation for actor AND critic MLPs: "elu" (paper
-    # A.2.1/2.2) or "silu" (SAPO's design choice V swaps ELU -> SiLU).
+    # A.2.1/2.2) or "silu" (SAPO design choice V swaps ELU -> SiLU).
     optimizer: str = "adam"
     # "adam" (paper, betas below) or "adamw" (SAPO choice V) -- AdamW with
     # identical lr/betas; only the decoupled weight decay differs.
@@ -265,14 +265,23 @@ class SHACConfig:
     # shapes match, but the ACTIVATION differs -- load() therefore rebuilds
     # from the checkpoint's algo_cfg when the field is present).
 
-    # --- critic ensemble / target-network ablation (SAPO choice IV) ----------
+    # --- critic ensemble / target-network ablation (SAPO-inspired) -----------
     critic_ensemble: int = 1
-    # Number of critics. 1 = paper. 2 = SAPO's design choice IV ("double
-    # critic"): bootstrap values are min-pooled over the ensemble (SAC's
-    # double-Q trick) for BOTH the actor's window bootstrap and the critic
-    # targets -- optimism bias of a single bootstrapped value is a known
-    # instability source. Both critics regress onto the SAME td-(lambda)
-    # targets; their losses are averaged for logging.
+    # Number of critics. 1 = paper. 2 = SAPO-inspired double critic (their
+    # design choice IV): bootstrap values are pooled over the ensemble for
+    # BOTH the actor's window bootstrap and the critic targets -- optimism
+    # bias of a single bootstrapped value is a known instability source.
+    # Both critics regress onto the SAME td-(lambda) targets; their losses
+    # are averaged for logging. NOTE: an arm using this switch alone is
+    # SHAC with a SAPO-inspired critic, NOT SAPO (which always combines
+    # ALL five design choices, entropy included).
+    actor_bootstrap_pool: str = "min"
+    # How the ENSEMBLE bootstrap is pooled in the ACTOR's window loss:
+    # "min" (pessimistic; what our SHAC+SAPO-inspired-IV arm used) or "avg"
+    # (what SAPO's paper actually specifies for the actor return -- average
+    # in the actor loss, min ONLY in the critic's bootstrap targets). The
+    # critic targets always use min regardless of this field. Single-critic
+    # runs are unaffected (no pooling).
     use_target_critic: bool = True
     # Polyak target network on/off. False + critic_ensemble=2 is exactly
     # SAPO's choice IV: bootstrap from the ONLINE critics (min-pooled),

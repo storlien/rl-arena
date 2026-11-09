@@ -310,18 +310,28 @@ class SHACTrainer:
     # STAGE 1+2: rollout one short-horizon window and update the ACTOR
     # (paper Eq. 5, gradient via backprop through the differentiable sim)
     # ======================================================================
-    def _bootstrap_value(self, obs: torch.Tensor) -> torch.Tensor:
-        """Terminal value V'(s_{t+1}) on normalized observations.
+    def _pool_bootstrap(self, obs: torch.Tensor, reduction: str = "min") -> torch.Tensor:
+        """Ensemble-pooled bootstrap value V(s) on normalized observations.
 
-        Default: the (min-pooled over the ensemble, if >1) TARGET critic.
-        SAPO choice IV (use_target_critic=False): the ONLINE critics,
-        min-pooled. The min is SAC's double-Q trick: with two independent
-        function approximators, max-type bootstrapping overestimates and
-        min-type underestimates slightly -- the latter is the safer bias.
+        `reduction`: "min" (SAC double-Q pessimism) or "avg" (SAPO's paper
+        §4.2 IV uses the AVERAGE of the two critics in the ACTOR's window
+        return, keeping min only for the critic's bootstrap targets --
+        pessimism where values are regressed, unbiased gradient where the
+        actor learns). Single-critic runs ignore the reduction.
+
+        Which networks: the (frozen) Polyak TARGET critics by default;
+        SAPO-inspired IV (use_target_critic=False): the ONLINE critics.
         """
         nets = self.target_critics if self.target_critics else self.critics
         vals = [c(obs).squeeze(-1) for c in nets]
-        return vals[0] if len(vals) == 1 else torch.stack(vals).min(dim=0).values
+        if len(vals) == 1:
+            return vals[0]
+        stacked = torch.stack(vals)
+        if reduction == "min":
+            return stacked.min(dim=0).values
+        if reduction == "avg":
+            return stacked.mean(dim=0)
+        raise ValueError(f"unknown bootstrap pooling '{reduction}' (min | avg)")
 
     def _run_window(self) -> torch.Tensor:
         """Rollout ONE short-horizon window and return the Eq. 5 actor loss
@@ -415,7 +425,16 @@ class SHACTrainer:
             # bootstrap term below vanishes and Eq. 5 degenerates to the
             # pure pathwise-derivative window reward.
             if self.use_critic:
-                nv = self._bootstrap_value(obs)
+                # Split pooling (SAPO §4.2 IV, faithful): the critic's
+                # td-(lambda) targets always bootstrap from the MIN-pooled
+                # ensemble (pessimism); the ACTOR's window loss uses
+                # cfg.actor_bootstrap_pool ("min" default = our SHAC+IV-
+                # style arm; "avg" = SAPO's actor-return pooling). With one
+                # critic the two are identical.
+                nv_t = self._pool_bootstrap(obs, "min")
+                nv_a = (nv_t if self.cfg.actor_bootstrap_pool == "min"
+                        else self._pool_bootstrap(
+                            obs, self.cfg.actor_bootstrap_pool))
                 if bool(done.any()):
                     # For envs that just finished an episode, replace the
                     # value:
@@ -424,11 +443,20 @@ class SHACTrainer:
                     #     would continue, so we bootstrap the state it died
                     #     on.
                     pre_reset = norm(info["obs_before_reset"])
-                    nv_limit = self._bootstrap_value(pre_reset)
+                    nv_limit_t = self._pool_bootstrap(pre_reset, "min")
+                    nv_limit_a = (nv_limit_t
+                                  if self.cfg.actor_bootstrap_pool == "min"
+                                  else self._pool_bootstrap(
+                                      pre_reset,
+                                      self.cfg.actor_bootstrap_pool))
                     at_limit = self.episode_steps >= self.H
-                    nv_term = torch.where(at_limit, nv_limit,
-                                          torch.zeros_like(nv_limit))
-                    nv = torch.where(done, nv_term, nv)
+                    nv_term_t = torch.where(at_limit, nv_limit_t,
+                                            torch.zeros_like(nv_limit_t))
+                    nv_term_a = torch.where(at_limit, nv_limit_a,
+                                            torch.zeros_like(nv_limit_a))
+                    nv_t = torch.where(done, nv_term_t, nv_t)
+                    nv_a = torch.where(done, nv_term_a, nv_a)
+                nv = nv_a
             else:
                 nv = torch.zeros(N, device=self.device)
 
@@ -481,7 +509,7 @@ class SHACTrainer:
                         # hat{h} here, alpha applied at target time (the
                         # post-dual alpha, per their pseudocode).
                         self.ent_buf[i] = ent_hat.detach()
-                    self.next_value_buf[i] = nv.detach()
+                    self.next_value_buf[i] = nv_t.detach()
                     # The window's last step is a bootstrap boundary for
                     # every env (its "terminal value" is V'(s_h));
                     # official: done_mask is forced to 1 on the final step.
