@@ -185,32 +185,59 @@ class SHACTrainer:
         self.actor = GaussianActor(self.num_obs, self.num_actions,
                                     self.cfg.actor_units,
                                     self.cfg.actor_logstd_init,
-                                    state_std=self.cfg.actor_state_std
+                                    state_std=self.cfg.actor_state_std,
+                                    activation=self.cfg.activation
                                     ).to(device)
         if self.use_critic:
-            self.critic = Critic(self.num_obs, self.cfg.critic_units).to(device)
-            # Target value network V' (paper Algorithm 1). Its PARAMETERS are
-            # frozen (updated only by Polyak averaging), which means gradients
-            # still flow through its INPUT (d V'/d s, needed for the terminal
-            # adjoint, paper Eq. 9) but never update its weights.
-            self.target_critic = copy.deepcopy(self.critic)
-            for p in self.target_critic.parameters():
-                p.requires_grad_(False)
+            # critic_ensemble=1 (default) reproduces the paper exactly; >=2
+            # is SAPO's design choice IV (see SHACConfig.critic_ensemble).
+            # self.critic / self.target_critic / self.critic_opt stay as
+            # aliases of the FIRST member so the logging, checkpoint and
+            # test code keep a single canonical handle.
+            self.critics = [Critic(self.num_obs, self.cfg.critic_units,
+                                   activation=self.cfg.activation).to(device)
+                            for _ in range(self.cfg.critic_ensemble)]
+            self.critic = self.critics[0]
+            if self.cfg.use_target_critic:
+                self.target_critics = [copy.deepcopy(c) for c in self.critics]
+                for t in self.target_critics:
+                    # Target PARAMETERS are frozen (updated only by Polyak
+                    # averaging); gradients still flow through their INPUT
+                    # (d V'/d s, needed for the terminal adjoint, paper Eq. 9)
+                    # but never update the weights.
+                    for p in t.parameters():
+                        p.requires_grad_(False)
+            else:
+                # SAPO choice IV: bootstrap from the ONLINE critics
+                # (min-pooled over the ensemble), no target network.
+                self.target_critics = []
+            self.target_critic = (self.target_critics[0]
+                                  if self.target_critics else None)
         else:
             # Ablation (--no-critic): no critic, no td-(lambda), no Polyak.
             # The actor loss below omits the gamma^h * V'(s_h) bootstrap term,
             # leaving only the pathwise-derivative window reward of Eq. 5.
+            self.critics = []
             self.critic = None
+            self.target_critics = []
             self.target_critic = None
 
-        # ---- optimizers (Adam with the paper's betas, per-network lrs) ----
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(),
-                                          lr=self.cfg.actor_learning_rate,
-                                          betas=self.cfg.adam_betas)
-        self.critic_opt = (torch.optim.Adam(self.critic.parameters(),
-                                            lr=self.cfg.critic_learning_rate,
-                                            betas=self.cfg.adam_betas)
-                           if self.use_critic else None)
+        # ---- optimizers (paper: Adam with the paper's betas; SAPO choice
+        #      V swaps in AdamW -- identical lr/betas, decoupled decay) ----
+        opt_cls = (torch.optim.Adam if self.cfg.optimizer == "adam"
+                   else torch.optim.AdamW)
+        if self.cfg.optimizer not in ("adam", "adamw"):
+            raise ValueError(
+                f"unknown optimizer '{self.cfg.optimizer}' (adam | adamw)")
+        self.actor_opt = opt_cls(self.actor.parameters(),
+                                 lr=self.cfg.actor_learning_rate,
+                                 betas=self.cfg.adam_betas)
+        self.critic_opts = ([opt_cls(c.parameters(),
+                                     lr=self.cfg.critic_learning_rate,
+                                     betas=self.cfg.adam_betas)
+                             for c in self.critics] if self.use_critic
+                            else [])
+        self.critic_opt = self.critic_opts[0] if self.critic_opts else None
 
         # ---- observation normalization (running mean/std) ----
         self.obs_rms = (RunningMeanStd((self.num_obs,), device=device)
@@ -283,6 +310,19 @@ class SHACTrainer:
     # STAGE 1+2: rollout one short-horizon window and update the ACTOR
     # (paper Eq. 5, gradient via backprop through the differentiable sim)
     # ======================================================================
+    def _bootstrap_value(self, obs: torch.Tensor) -> torch.Tensor:
+        """Terminal value V'(s_{t+1}) on normalized observations.
+
+        Default: the (min-pooled over the ensemble, if >1) TARGET critic.
+        SAPO choice IV (use_target_critic=False): the ONLINE critics,
+        min-pooled. The min is SAC's double-Q trick: with two independent
+        function approximators, max-type bootstrapping overestimates and
+        min-type underestimates slightly -- the latter is the safer bias.
+        """
+        nets = self.target_critics if self.target_critics else self.critics
+        vals = [c(obs).squeeze(-1) for c in nets]
+        return vals[0] if len(vals) == 1 else torch.stack(vals).min(dim=0).values
+
     def _run_window(self) -> torch.Tensor:
         """Rollout ONE short-horizon window and return the Eq. 5 actor loss
         (normalized by N*h), with its autograd graph attached.
@@ -375,7 +415,7 @@ class SHACTrainer:
             # bootstrap term below vanishes and Eq. 5 degenerates to the
             # pure pathwise-derivative window reward.
             if self.use_critic:
-                nv = self.target_critic(obs).squeeze(-1)
+                nv = self._bootstrap_value(obs)
                 if bool(done.any()):
                     # For envs that just finished an episode, replace the
                     # value:
@@ -384,7 +424,7 @@ class SHACTrainer:
                     #     would continue, so we bootstrap the state it died
                     #     on.
                     pre_reset = norm(info["obs_before_reset"])
-                    nv_limit = self.target_critic(pre_reset).squeeze(-1)
+                    nv_limit = self._bootstrap_value(pre_reset)
                     at_limit = self.episode_steps >= self.H
                     nv_term = torch.where(at_limit, nv_limit,
                                           torch.zeros_like(nv_limit))
@@ -466,21 +506,32 @@ class SHACTrainer:
         # Eq. 5 normalization by N*h (paper Algorithm 1).
         return actor_loss / (N * h)
 
-    def _rollout_and_update_actor(self) -> Dict[str, float]:
-        """ONE learning episode: window rollout + ONE Adam step (Alg. 1)."""
+    def _rollout_and_update_actor(self,
+                                  update_actor: bool = True) -> Dict[str, float]:
+        """ONE learning episode: window rollout + ONE Adam step (Alg. 1).
+
+        update_actor=False is the TD3-style critic warmup
+        (SHACConfig.critic_warmup): the window still rolls out (the critic
+        needs on-policy data, and the obs_rms must track the same stream
+        it would see in normal training) but the actor gets no gradient
+        step and the alpha dual is skipped.
+        """
         N, h = self.num_envs, self.h
         actor_loss = self._run_window()
 
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
+        if update_actor:
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.actor.parameters(), self.cfg.grad_norm_clip)
-        if not torch.isfinite(grad_norm):
-            raise RuntimeError(
-                f"Non-finite actor gradient norm ({grad_norm}). The "
-                "simulation probably diverged -- check action bounds/dt.")
-        self.actor_opt.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor.parameters(), self.cfg.grad_norm_clip)
+            if not torch.isfinite(grad_norm):
+                raise RuntimeError(
+                    f"Non-finite actor gradient norm ({grad_norm}). The "
+                    "simulation probably diverged -- check action bounds/dt.")
+            self.actor_opt.step()
+        else:
+            grad_norm = None
 
         # ---- the alpha dual (SAC Eq. 21 as instantiated by SAPO) ----
         # Gradient-ascent on the dual objective J(alpha) = alpha*(H-bar - h)
@@ -490,7 +541,7 @@ class SHACTrainer:
         # POST-dual value (SAPO's pseudocode order). Clamped at 0: the
         # entropy bonus must never become a penalty.
         alpha_used = self.entropy_alpha
-        if self.max_entropy:
+        if self.max_entropy and update_actor:
             self.entropy_alpha = max(
                 0.0, self.entropy_alpha - self.cfg.entropy_lr
                 * self._window_ent_dual)
@@ -498,11 +549,13 @@ class SHACTrainer:
         self.total_env_steps += N * h
         return {
             "actor_loss": float(actor_loss.item()),
-            "actor_grad_norm": float(grad_norm.item()),
+            # None keeps the CSV schema identical during warmup episodes.
+            "actor_grad_norm": (float(grad_norm.item())
+                                if grad_norm is not None else None),
             "policy_std": self.actor.std(),
             # alpha that entered THIS episode's actor loss (pre-dual);
             # None keeps the CSV schema identical when the flag is off.
-            "entropy_alpha": alpha_used if self.max_entropy else None,
+            "entropy_alpha": (alpha_used if self.max_entropy else None),
             "policy_entropy": (self._window_ent_mean if self.max_entropy
                                else None),
         }
@@ -602,43 +655,53 @@ class SHACTrainer:
             for b in range(num_batches):
                 idx = slice(b * batch_size, min((b + 1) * batch_size,
                                                  obs_flat.shape[0]))
-                pred = self.critic(obs_flat[idx]).squeeze(-1)
-                loss = F.mse_loss(pred, tgt_flat[idx])
+                # With an ensemble (SAPO choice IV) every critic regresses
+                # onto the SAME targets (built from the min-pooled
+                # bootstrap); the ensemble only diversifies the BOOTSTRAP
+                # value, not the regression problem. Losses are averaged
+                # for logging.
+                for critic, opt in zip(self.critics, self.critic_opts):
+                    pred = critic(obs_flat[idx]).squeeze(-1)
+                    loss = F.mse_loss(pred, tgt_flat[idx])
 
-                self.critic_opt.zero_grad()
-                loss.backward()
-                # Official "ugly fix": sanitize non-finite grads if the
-                # simulation ever produced NaN observations. This is a
-                # DELIBERATE asymmetry with the actor path, which RAISES
-                # on non-finite gradients: a critic MSE spike (e.g. at the
-                # lockstep task resets, or the first episodes' fitting
-                # transient) is transient and absorbable, while a
-                # non-finite actor gradient means the rollout itself
-                # diverged and must not be silently trained through.
-                for p in self.critic.parameters():
-                    if p.grad is not None:
-                        p.grad.nan_to_num_(0.0)
-                # clip_grad_norm_ returns the PRE-clip total norm; keep it
-                # (its mean is logged as critic_grad_norm -- previously
-                # discarded, cf. actor_grad_norm).
-                gnorm = torch.nn.utils.clip_grad_norm_(
-                    self.critic.parameters(), self.cfg.grad_norm_clip)
-                self.critic_opt.step()
+                    opt.zero_grad()
+                    loss.backward()
+                    # Official "ugly fix": sanitize non-finite grads if the
+                    # simulation ever produced NaN observations. This is a
+                    # DELIBERATE asymmetry with the actor path, which RAISES
+                    # on non-finite gradients: a critic MSE spike (e.g. at
+                    # the lockstep task resets, or the first episodes'
+                    # fitting transient) is transient and absorbable, while
+                    # a non-finite actor gradient means the rollout itself
+                    # diverged and must not be silently trained through.
+                    for p in critic.parameters():
+                        if p.grad is not None:
+                            p.grad.nan_to_num_(0.0)
+                    # clip_grad_norm_ returns the PRE-clip total norm; keep
+                    # it (its mean is logged as critic_grad_norm --
+                    # previously discarded, cf. actor_grad_norm).
+                    gnorm = torch.nn.utils.clip_grad_norm_(
+                        critic.parameters(), self.cfg.grad_norm_clip)
+                    opt.step()
 
-                total_loss += float(loss.item())
-                total_gnorm += float(gnorm.item())
-                steps += 1
-        return total_loss / max(steps, 1), total_gnorm / max(steps, 1)
+                    total_loss += float(loss.item())
+                    total_gnorm += float(gnorm.item())
+                    steps += 1
+        n = max(steps, 1)
+        return total_loss / n, total_gnorm / n
 
     # ======================================================================
     # STAGE 4: Polyak-update the target critic (paper Algorithm 1)
     # ======================================================================
     def _update_target_critic(self) -> None:
+        if not self.target_critics:
+            return      # SAPO choice IV: no target networks, no Polyak
         alpha = self.cfg.target_critic_alpha
         with torch.no_grad():
-            for p, p_tgt in zip(self.critic.parameters(),
-                                self.target_critic.parameters()):
-                p_tgt.data.mul_(alpha).add_(p.data, alpha=1.0 - alpha)
+            for critic, target in zip(self.critics, self.target_critics):
+                for p, p_tgt in zip(critic.parameters(),
+                                    target.parameters()):
+                    p_tgt.data.mul_(alpha).add_(p.data, alpha=1.0 - alpha)
 
     # ======================================================================
     # Main training loop
@@ -674,7 +737,8 @@ class SHACTrainer:
                   and episode % self.run_cfg.grad_var_interval == 0
                   else None)
 
-            stats = self._rollout_and_update_actor()     # stages 1-2
+            stats = self._rollout_and_update_actor(
+                update_actor=(episode > self.cfg.critic_warmup))  # st. 1-2
             if self.use_critic:
                 (stats["critic_loss"],
                  stats["critic_grad_norm"]) = self._update_critic()  # st. 3
@@ -787,14 +851,25 @@ class SHACTrainer:
     def save(self, suffix: str = "policy") -> str:
         assert self.logger is not None, "saving requires a logger/logdir"
         path = f"{self.logger.logdir}/{suffix}.pt"
+        # Ensemble checkpoints (critic_ensemble > 1) store LISTS under
+        # "critics"/"target_critics"; single-critic checkpoints keep the
+        # historical "critic"/"target_critic" keys so every old consumer
+        # (and old checkpoints) keep working unchanged.
+        ensemble = len(self.critics) > 1
         torch.save({
             "actor": self.actor.state_dict(),
-            "critic": (self.critic.state_dict() if self.use_critic else None),
-            "target_critic": (self.target_critic.state_dict()
-                              if self.use_critic else None),
-            "actor_opt": self.actor_opt.state_dict(),
-            "critic_opt": (self.critic_opt.state_dict()
+            **({"critics": [c.state_dict() for c in self.critics],
+                "target_critics": [t.state_dict()
+                                   for t in self.target_critics],
+                "critic_opts": [o.state_dict() for o in self.critic_opts]}
+               if ensemble else
+               {"critic": (self.critic.state_dict()
                            if self.use_critic else None),
+                "target_critic": (self.target_critic.state_dict()
+                                  if self.use_critic else None),
+                "critic_opt": (self.critic_opt.state_dict()
+                               if self.use_critic else None)}),
+            "actor_opt": self.actor_opt.state_dict(),
             "obs_rms": (self.obs_rms.state_dict()
                         if self.obs_rms is not None else None),
             "env_cfg": self.env_cfg.__dict__,
@@ -826,16 +901,34 @@ class SHACTrainer:
             raise ValueError(
                 f"checkpoint env '{env_name}' does not match this "
                 f"trainer's env '{self.env_name}'")
+        # The activation is an architecture choice baked into the weights'
+        # TRAINING behavior (shapes match regardless, so this would fail
+        # silently as a subtly different network) -- refuse the mismatch.
+        ckpt_act = ckpt["algo_cfg"].get("activation", "elu")
+        if ckpt_act != self.cfg.activation:
+            raise ValueError(
+                f"checkpoint was trained with activation='{ckpt_act}', "
+                f"this trainer uses '{self.cfg.activation}'")
         self.actor.load_state_dict(ckpt["actor"])
         self.actor_opt.load_state_dict(ckpt["actor_opt"])
+        if self.use_critic:
+            if "critics" in ckpt:          # ensemble checkpoint
+                for c, sd in zip(self.critics, ckpt["critics"]):
+                    c.load_state_dict(sd)
+                for t, sd in zip(self.target_critics,
+                                 ckpt["target_critics"]):
+                    t.load_state_dict(sd)
+                for o, sd in zip(self.critic_opts, ckpt["critic_opts"]):
+                    o.load_state_dict(sd)
+            else:                          # single-critic checkpoint
+                self.critics[0].load_state_dict(ckpt["critic"])
+                if (self.target_critics
+                        and ckpt.get("target_critic") is not None):
+                    self.target_critics[0].load_state_dict(
+                        ckpt["target_critic"])
+                self.critic_opts[0].load_state_dict(ckpt["critic_opt"])
         if self.obs_rms is not None and ckpt["obs_rms"] is not None:
             self.obs_rms.load_state_dict(ckpt["obs_rms"])
-        # The critic keys are None in --no-critic checkpoints; restore them
-        # only when both this trainer and the checkpoint have a critic.
-        if self.use_critic and ckpt.get("critic") is not None:
-            self.critic.load_state_dict(ckpt["critic"])
-            self.target_critic.load_state_dict(ckpt["target_critic"])
-            self.critic_opt.load_state_dict(ckpt["critic_opt"])
         # Restore the dual-tuned temperature so a resumed max-entropy run
         # continues the schedule where it left off (older/other-mode
         # checkpoints simply have no key, and non-entropy trainers ignore

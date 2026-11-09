@@ -100,7 +100,8 @@ def build_mlp(input_dim: int, output_dim: int, units: Tuple[int, ...],
     PyTorch's default init -- we use orthogonal init for both here, which is
     the more standard choice and trains equivalently on this task.
     """
-    act_fn = {"elu": nn.ELU, "relu": nn.ReLU, "tanh": nn.Tanh}[activation]
+    act_fn = {"elu": nn.ELU, "relu": nn.ReLU, "tanh": nn.Tanh,
+              "silu": nn.SiLU}[activation]
     dims = [input_dim] + list(units) + [output_dim]
     layers = []
     for i in range(len(dims) - 1):
@@ -137,7 +138,8 @@ class GaussianActor(nn.Module):
     """
 
     def __init__(self, obs_dim: int, action_dim: int, units: Tuple[int, ...],
-                 logstd_init: float = -1.0, state_std: bool = False):
+                 logstd_init: float = -1.0, state_std: bool = False,
+                 activation: str = "elu"):
         super().__init__()
         self.action_dim = action_dim
         self.state_std = state_std
@@ -146,14 +148,16 @@ class GaussianActor(nn.Module):
         self._std_acc, self._std_n = 0.0, 0
         if state_std:
             # One MLP with a SAC-style [mu | log_std(s)] head.
-            self.mu_net = build_mlp(obs_dim, 2 * action_dim, units)
+            self.mu_net = build_mlp(obs_dim, 2 * action_dim, units,
+                                    activation=activation)
             head = [m for m in self.mu_net.modules()
                     if isinstance(m, nn.Linear)][-1]
             with torch.no_grad():
                 head.weight[action_dim:].zero_()
                 head.bias[action_dim:] = float(logstd_init)
         else:
-            self.mu_net = build_mlp(obs_dim, action_dim, units)
+            self.mu_net = build_mlp(obs_dim, action_dim, units,
+                                    activation=activation)
             # One learnable log-std per action dimension (official ActorStochasticMLP).
             self.logstd = nn.Parameter(
                 torch.full((action_dim,), float(logstd_init)))
@@ -241,9 +245,10 @@ class GaussianActor(nn.Module):
 class Critic(nn.Module):
     """State-value function V_phi(s) -> scalar."""
 
-    def __init__(self, obs_dim: int, units: Tuple[int, ...]):
+    def __init__(self, obs_dim: int, units: Tuple[int, ...],
+                 activation: str = "elu"):
         super().__init__()
-        self.v_net = build_mlp(obs_dim, 1, units)
+        self.v_net = build_mlp(obs_dim, 1, units, activation=activation)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Returns V(s) with shape [batch, 1] (squeeze in the caller)."""

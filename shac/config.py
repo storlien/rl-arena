@@ -251,6 +251,44 @@ class SHACConfig:
     # uses the much faster 0.2 (target moves 80% toward the critic each
     # episode). Keep 0.2 for CartPole.
 
+    # --- architecture / optimizer switches (SAPO choice V; ablation-only) ----
+    activation: str = "elu"
+    # Hidden-layer activation for actor AND critic MLPs: "elu" (paper
+    # A.2.1/2.2) or "silu" (SAPO's design choice V swaps ELU -> SiLU).
+    optimizer: str = "adam"
+    # "adam" (paper, betas below) or "adamw" (SAPO choice V) -- AdamW with
+    # identical lr/betas; only the decoupled weight decay differs.
+    # Both switches are no-ops on already-trained checkpoint LOADING (the
+    # activation is rebuilt from the checkpoint's algo_cfg, so a silu run
+    # reloads as silu; an elu trainer loading a silu checkpoint fails on
+    # the state-dict shape mismatch of the LayerNorm-free SiLU... actually
+    # shapes match, but the ACTIVATION differs -- load() therefore rebuilds
+    # from the checkpoint's algo_cfg when the field is present).
+
+    # --- critic ensemble / target-network ablation (SAPO choice IV) ----------
+    critic_ensemble: int = 1
+    # Number of critics. 1 = paper. 2 = SAPO's design choice IV ("double
+    # critic"): bootstrap values are min-pooled over the ensemble (SAC's
+    # double-Q trick) for BOTH the actor's window bootstrap and the critic
+    # targets -- optimism bias of a single bootstrapped value is a known
+    # instability source. Both critics regress onto the SAME td-(lambda)
+    # targets; their losses are averaged for logging.
+    use_target_critic: bool = True
+    # Polyak target network on/off. False + critic_ensemble=2 is exactly
+    # SAPO's choice IV: bootstrap from the ONLINE critics (min-pooled),
+    # no target network, no Polyak step. False + critic_ensemble=1 is the
+    # (unstable) degenerate single-online-critic -- allowed for ablation
+    # completeness but not recommended.
+
+    # --- TD3-style critic warmup ---------------------------------------------
+    critic_warmup: int = 0
+    # First W episodes train the critic ONLY (the window rollout still runs
+    # -- the critic needs on-policy data and the obs_rms must track the
+    # same stream -- but the actor gets no gradient step and the alpha dual
+    # is skipped). Rationale: the critic's MSE starts ~800; until it has
+    # fitted, the actor's bootstrap gradient points at noise. TD3 delays
+    # POLICY updates for the same reason. 0 = paper behavior.
+
     # --- actor network -------------------------------------------------------
     actor_units: Tuple[int, ...] = (64, 64)   # paper Table 1 (CartPole)
     critic_units: Tuple[int, ...] = (64, 64)  # paper Table 1 (CartPole)

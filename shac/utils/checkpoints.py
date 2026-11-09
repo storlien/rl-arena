@@ -42,8 +42,8 @@ def build_actor_and_rms(ckpt: dict, env: DifferentiableEnv, device="cpu"):
     actor = GaussianActor(env.num_obs, env.num_actions,
                           tuple(algo["actor_units"]),
                           algo["actor_logstd_init"],
-                          state_std=algo.get("actor_state_std",
-                                             False)).to(device)
+                          state_std=algo.get("actor_state_std", False),
+                          activation=algo.get("activation", "elu")).to(device)
     actor.load_state_dict(ckpt["actor"])
     actor.eval()
     rms = None

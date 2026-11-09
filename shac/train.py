@@ -83,6 +83,25 @@ def parse_args() -> argparse.Namespace:
                         "short-horizon window reward of paper Eq. 5 (no "
                         "terminal bootstrap, no td-(lambda), no target "
                         "network); i.e. discounted short-horizon BPTT")
+    p.add_argument("--critic-warmup", type=int, default=0, metavar="W",
+                   help="train the critic ONLY for the first W episodes "
+                        "(TD3-style delayed policy update): the rollout "
+                        "still runs but the actor gets no gradient step "
+                        "and the alpha dual is skipped")
+    p.add_argument("--critic-ensemble", type=int, default=1, metavar="K",
+                   help="number of critics (SAPO design choice IV: K=2); "
+                        "bootstrap values are min-pooled over the ensemble "
+                        "(SAC's double-Q trick)")
+    p.add_argument("--no-target-critic", action="store_true",
+                   help="bootstrap from the ONLINE critics, no Polyak "
+                        "target network (with --critic-ensemble 2 this is "
+                        "exactly SAPO's choice IV)")
+    p.add_argument("--activation", default="elu", choices=["elu", "silu"],
+                   help="hidden-layer activation for actor and critic "
+                        "(silu = SAPO design choice V)")
+    p.add_argument("--optimizer", default="adam", choices=["adam", "adamw"],
+                   help="optimizer for both networks (adamw = SAPO design "
+                        "choice V; identical lr/betas, decoupled decay)")
     p.add_argument("--state-std", action="store_true",
                    help="experimental A/B: SAC-style STATE-DEPENDENT policy "
                         "std (the paper's sigma_theta(s) notation) -- the "
@@ -163,6 +182,11 @@ def main() -> None:
         entropy_target=args.entropy_target,
         entropy_lr=args.entropy_lr,
         entropy_init_alpha=args.entropy_init_alpha,
+        critic_warmup=args.critic_warmup,
+        critic_ensemble=args.critic_ensemble,
+        use_target_critic=not args.no_target_critic,
+        activation=args.activation,
+        optimizer=args.optimizer,
     )
     run_cfg = RunConfig(
         seed=args.seed,
