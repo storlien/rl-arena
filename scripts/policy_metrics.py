@@ -1,5 +1,6 @@
 """
-Behavioral metrics for trained CartPole Swing-Up checkpoints.
+Behavioral metrics for trained checkpoints (CartPole Swing-Up, Pendulum
+Swing-Up, ... -- dispatched from the checkpoint's env_name).
 
 Goes beyond the scalar return and measures WHAT the policy does: does it
 swing up, how long does the swing-up take, and how well does it balance
@@ -40,8 +41,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import torch
 
-from shac.config import EnvConfig
-from shac.envs.cartpole_swingup import CartPoleSwingUpEnv
+from shac.envs import make_env, make_env_config
 from shac.models.networks import GaussianActor
 from shac.utils.running_stats import RunningMeanStd
 
@@ -49,11 +49,33 @@ UPRIGHT_RAD = 0.25     # within 14 deg of upright counts as "up"
 HOLD_STEPS = 10        # ... and it must hold for this many consecutive steps
 BALANCE_WINDOW = 60    # mean |theta| over the last N steps -> balance offset
 
+# Where (sin, cos) of the wrapped angle live in each env's observation.
+#   cartpole: [x, x_dot, sin, cos, theta_dot]
+#   pendulum: [cos, sin, theta_dot]
+SIN_COS_IDX = {
+    "cartpole": (2, 3),
+    "pendulum": (1, 0),
+}
+
 
 def load_policy(path, device):
+    """Load a checkpoint -> (env_name, env_cfg, ckpt). The actor (whose
+    input size is an env property) and the obs normalizer are rebuilt by
+    the caller once the env exists."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    env_cfg = EnvConfig(**ckpt["env_cfg"])
-    actor = GaussianActor(5, 1,
+    env_name = ckpt.get("env_name", "cartpole")   # pre-registry checkpoints
+    env_cfg = make_env_config(env_name, **ckpt["env_cfg"])
+    return env_name, env_cfg, ckpt
+
+
+@torch.no_grad()
+def evaluate_checkpoint(path, device, num_episodes, seed):
+    """Run `num_episodes` deterministic episodes; return a metrics dict."""
+    torch.manual_seed(seed)
+    env_name, env_cfg, ckpt = load_policy(path, device)
+    env = make_env(env_name, env_cfg, device, num_envs=num_episodes)
+
+    actor = GaussianActor(env.num_obs, env.num_actions,
                           tuple(ckpt["algo_cfg"]["actor_units"]),
                           ckpt["algo_cfg"]["actor_logstd_init"],
                           state_std=ckpt["algo_cfg"].get(
@@ -62,18 +84,10 @@ def load_policy(path, device):
     actor.eval()
     rms = None
     if ckpt["obs_rms"] is not None:
-        rms = RunningMeanStd((5,), device=device)
+        rms = RunningMeanStd((env.num_obs,), device=device)
         rms.load_state_dict(ckpt["obs_rms"])
-    return env_cfg, actor, rms
 
-
-@torch.no_grad()
-def evaluate_checkpoint(path, device, num_episodes, seed):
-    """Run `num_episodes` deterministic episodes; return a metrics dict."""
-    torch.manual_seed(seed)
-    env_cfg, actor, rms = load_policy(path, device)
-    env = CartPoleSwingUpEnv(env_cfg, device, num_envs=num_episodes)
-
+    sin_i, cos_i = SIN_COS_IDX[env_name]
     obs = env.reset()
     returns = torch.zeros(num_episodes, device=device)
     thetas = []                      # |theta| per step, [T, num_episodes]
@@ -82,7 +96,7 @@ def evaluate_checkpoint(path, device, num_episodes, seed):
         action = torch.tanh(actor(o, deterministic=True))
         obs, rew, done, _ = env.step(action)
         returns += rew
-        theta = torch.atan2(obs[:, 2], obs[:, 3]).abs()
+        theta = torch.atan2(obs[:, sin_i], obs[:, cos_i]).abs()
         thetas.append(theta)
 
     abs_theta = torch.stack(thetas)                    # [T, E]
