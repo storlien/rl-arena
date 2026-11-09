@@ -137,5 +137,95 @@ balances with small torque), eval std < 50, plus a visual rollout check.
 
 ## 5. Results
 
-*(to be filled after the 500-episode run — training curve, rollout GIF,
-and the behavioral metrics from `scripts/policy_metrics.py`)*
+**Status: the success bar is NOT met.** Training is stable and improves
+from hanging (−2369) to a consistent "swing most of the way up and
+oscillate through top" policy (best eval −1376, ≈ 18.8% of steps within
+14° of upright), but it never locks in the balance, and every attempt to
+push past the plateau has come back null so far. Single-seed protocol
+(seed 0) throughout; the plateau is horizon-invariant, so we treat it as
+a property of the task setup, not of one run.
+
+### 5.1 The baseline run (500 episodes, h = 32)
+
+`runs/pendulum_20261109_155434/` — paper CartPole hyperparameters, only
+re-deriving what the task forces (§3):
+
+| metric | value |
+|---|---|
+| best eval return | **−1376.0** (ep 480) |
+| mean of last 5 evals | −1455.2 ± 51.2 |
+| policy σ (start → end) | 0.364 → 0.169 |
+| swing-up fraction (16 det. eval eps) | 18.8% of steps within 14° of upright |
+| time to first upright (when reached) | ≈ 227 of 240 steps |
+| balance offset (last 60 steps) | ≈ 56° |
+
+Behaviorally: the deterministic policy pumps energy with alternating
+full-ish torques, gets the link swinging through the top region, but
+arrives there too fast/misaligned to hold — it keeps orbiting the
+upright instead of capturing it. `best_policy_rollout.gif` and
+`best_policy_traces.png` in the run dir show the orbit;
+`training.png` the curve.
+
+A horizon sweep (`runs/pendulum_h{16,64,128}`, best −1360…−1376 each)
+shows the plateau is **h-invariant**, and the σ anneal 0.36 → 0.17 is
+too — by the time the link reaches the top region reliably, exploration
+has shrunk to ~0.17 and the capture maneuver is never sampled enough to
+be reinforced.
+
+### 5.2 The maximum-entropy arms (preregistered 2×2)
+
+The σ collapse suggested the SAC/SAPO-style entropy bonus
+([MAX_ENTROPY.md](MAX_ENTROPY.md), already implemented and unit-tested).
+Before running, we measured the tanh-Gaussian entropy↔σ mapping at
+μ = 0 and found the SAPO-default target Ĥ = −0.5 corresponds to
+σ ≈ 0.15 — *below* the plateau's already-collapsed σ ≈ 0.17 — so the
+2×2 crosses σ mode (global / state) with target (−0.5 default / 0.0
+raised, which floors σ ≈ 0.42, above the init 0.36). Hypothesis: the
+dual holds exploration wide enough that the capture maneuver gets
+sampled and reinforced, breaking the plateau.
+
+500 episodes each, seed 0, otherwise identical to the baseline:
+
+| arm | best eval (ep) | last 5 evals | σ start → end | Ĥ start → end | α end | swing-up |
+|---|---|---|---|---|---|---|
+| baseline (no entropy) | **−1376.0** (480) | −1455 ± 51 | 0.36 → 0.17 | — | — | 18.8% |
+| A1 global, t = −0.5 | −1427.9 (420) | −1531 ± 69 | 0.37 → **0.64** | +0.28 → −0.46 | 0.34 | 0% |
+| A2 global, t = 0.0 | −1515.6 (480) | −1603 ± 60 | 0.37 → **0.72** | +0.28 → +0.02 | 0.57 | 0% |
+| B1 state, t = −0.5 | −1428.6 (290) | −1557 ± 66 | 0.37 → **0.64** | +0.28 → −0.55 | 0.33 | 0% |
+| B2 state, t = 0.0 | −1538.5 (290) | −1632 ± 53 | 0.37 → **0.70** | +0.28 → −0.03 | 0.58 | 0% |
+
+(`runs/pendulum_ent_{global,state}_{t-05,t00}/`, one `training.png`
+each; behavioral metrics from `scripts/policy_metrics.py` on each
+`best_policy.pt`.)
+
+**The dual works exactly as designed — and that is the problem.** Every
+arm's entropy lands on its target (mechanism H1 confirmed again). But
+unlike CartPole, where the floor *pins* σ ≈ 0.15, here σ **grows**
+0.37 → 0.64–0.72. The reason is the tanh Jacobian: the entropy of the
+squashed policy is suppressed by the mean's distance from 0, and the
+learned mean parks at large torques (mean |μ| ≈ 1.2, |tanh μ| ≈ 0.84,
+where log(1 − tanh²u) ≈ −1.2). At μ = 0, σ = 0.64 would mean Ĥ ≈ +0.63;
+on-policy it is −0.46. To hold Ĥ at target against the reward's pull
+toward big torques, the dual lets the base σ inflate — and that noise
+destroys the precise alternating-torque timing the swing-up needs (the
+direct u² tax of the noise is small — the tanh Jacobian shrinks it where
+the mean is large — the real cost is behavioral): all four best policies
+score **0% swing-up**, strictly worse than the baseline's 18.8%.
+
+Verdict: the entropy premium fails here for the *opposite* reason it
+fails on CartPole. CartPole at 1.02M steps has no exploration problem
+left (MAX_ENTROPY.md's interpretation 2); the pendulum genuinely has
+one — but its exploration is expensive (torque-taxed noise through a
+tanh-squashed 1-D action), and paying that premium everywhere to buy a
+few more top-region samples costs more than the samples return at this
+budget. Same practical conclusion, sharper mechanism.
+
+### 5.3 Open levers (not yet run)
+
+* **σ₀ init**: `actor_logstd_init` −1.0 → −0.5 (σ₀ 0.37 → 0.61) without
+  entropy — widen early exploration on the task's own schedule instead
+  of the dual's.
+* **Multi-seed confirmation** of the baseline plateau (3–5 seeds) before
+  investing further.
+* Longer budget (1000+ episodes): the baseline was still inching up at
+  ep 500 (best at ep 480).

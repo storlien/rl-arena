@@ -20,7 +20,10 @@ entropy insurance premium costs more than it pays. Verdict: keep the
 official objective; the negative result bounds SAPO's scope rather than
 contradicting it (their gains are on contact-rich/deformable tasks
 where SHAC stalls in local minima — CartPole at 1.02M steps isn't
-that).
+that). **Update:** the [pendulum follow-up](#the-pendulum-entropy-on-a-task-that-actually-stalls)
+below then tested exactly that regime — a task where SHAC *does* stall
+in a local optimum — and entropy still lost, narrowing the bound
+further.
 
 ---
 
@@ -251,6 +254,68 @@ boundary: at toy scale and budget, the SAC entropy term is a pure cost
 ({III,IV,V} without entropy: +0.5% on DFlex, i.e. also not where the
 gain is).
 
+## The pendulum: entropy on a task that actually stalls
+
+The CartPole null above left SAPO's claimed regime untouched: their
+gains are where SHAC *stalls in local minima*. The pendulum
+([PENDULUM.md](PENDULUM.md)) is precisely such a task in this repo —
+the plain objective plateaus at "swing through the top but never
+capture it" (best eval −1376 ≈ 42% of the way from hanging-still −2369
+to perfect 0), horizon-invariantly, with σ annealed 0.36 → 0.17 by the
+time the top region is reached. If keeping exploration alive ever pays,
+it should pay here.
+
+**Preregistration.** Before running we measured the tanh-Gaussian
+entropy↔σ mapping at μ = 0: the SAPO-default Ĥ = −0.5 corresponds to
+σ ≈ 0.15, *below* the plateau's collapsed σ — the default arm could not
+possibly inject exploration. So we crossed σ mode (global / state) with
+target (−0.5 / **0.0**, flooring σ ≈ 0.42 > init 0.36), 500 episodes,
+seed 0, all else identical to the pendulum baseline. Hypothesis: the
+dual holds exploration wide enough that the top-region capture maneuver
+gets sampled and reinforced.
+
+| arm | best eval (ep) | last 5 evals | σ start → end | Ĥ end | swing-up |
+|---|---|---|---|---|---|
+| baseline (no entropy) | **−1376.0** (480) | −1455 ± 51 | 0.36 → 0.17 | — | **18.8%** |
+| global, t = −0.5 | −1427.9 (420) | −1531 ± 69 | 0.37 → 0.64 | −0.46 | 0% |
+| global, t = 0.0 | −1515.6 (480) | −1603 ± 60 | 0.37 → 0.72 | +0.02 | 0% |
+| state, t = −0.5 | −1428.6 (290) | −1557 ± 66 | 0.37 → 0.64 | −0.55 | 0% |
+| state, t = 0.0 | −1538.5 (290) | −1632 ± 53 | 0.37 → 0.70 | −0.03 | 0% |
+
+(swing-up = fraction of deterministic-eval steps within 14° of upright;
+0% means the best policy never reaches the top region at all.)
+
+Three findings:
+
+1. **The dual works; the target is enforced — but σ is not floored, it
+   is INFLATED.** Unlike CartPole (dual pins σ ≈ 0.15), every arm's σ
+   *grows* 0.37 → 0.64–0.72. The mechanism: the squashed-policy entropy
+   is suppressed by the mean's distance from 0, and the reward parks the
+   mean at large torques (mean |μ| ≈ 1.2, |tanh μ| ≈ 0.84, where
+   log(1 − tanh²u) ≈ −1.2). At μ = 0, σ = 0.64 would give Ĥ ≈ +0.63;
+   on-policy it is −0.46. The dual holds Ĥ at target by widening the
+   base σ against the reward's pull.
+2. **The inflation is fatal to the maneuver.** Swing-up here needs
+   precisely timed alternating torques; σ ≈ 0.7 of action noise
+   corrupts the timing, and every entropy arm's best policy scores 0%
+   swing-up — strictly worse than the baseline's 18.8%. (The direct u²
+   tax of the noise is small — the tanh Jacobian shrinks it where the
+   mean is large; the cost is behavioral, not arithmetic.)
+3. **More target = worse, monotonically.** t = 0.0 (wider floor) is
+   uniformly worse than t = −0.5 on both σ modes. There is no dose at
+   which the medicine helps in sight.
+
+**Scope conclusion.** This is the SAPO regime failing: a dense-reward
+task where SHAC genuinely stalls in a local optimum, where entropy
+insurance was supposed to pay — and it does not, because on this task
+exploration is *expensive* (torque-limited 1-D action through a tanh;
+noise taxes reward and destroys a timing-critical maneuver). SAPO's
+wins remain plausible exactly where they were demonstrated —
+contact-rich/deformable simulation with high-dimensional actions and
+cheap noise — and this experiment removes the tempting middle case
+"stalled low-dimensional swing-up" from their scope. Full details,
+baseline diagnosis and open levers: [PENDULUM.md §5](PENDULUM.md).
+
 ## Reproducing
 
 ```bash
@@ -267,6 +332,17 @@ uv run python scripts/plot_max_entropy.py
 # per-run training figures
 uv run python scripts/plot_training.py runs/std_ent_state_500ep
 uv run python scripts/plot_training.py runs/std_ent_global_500ep
+
+# ---- the pendulum follow-up (PENDULUM.md section 5.2) -----------------
+# baseline first (the control), then the 2x2: {global, state} x {t=-0.5, 0.0}
+uv run python -m shac.train --env pendulum --logdir runs/pendulum_20261109_155434 \
+    --seed 0 --episodes 500 --device cpu --threads 1
+for t in "" " --entropy-target 0.0"; do
+  uv run python -m shac.train --env pendulum --seed 0 --episodes 500 --device cpu \
+      --threads 1 --max-entropy $t --logdir "runs/pendulum_ent_global_t${t:-05}"
+  uv run python -m shac.train --env pendulum --seed 0 --episodes 500 --device cpu \
+      --threads 1 --state-std --max-entropy $t --logdir "runs/pendulum_ent_state_t${t:-05}"
+done
 
 # the five correctness tests
 uv run python tests/test_max_entropy.py
