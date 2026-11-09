@@ -72,9 +72,10 @@ import copy
 import torch
 import torch.nn.functional as F
 
-from shac.config import EnvConfig, SHACConfig, RunConfig
+from shac.config import EnvConfigBase, SHACConfig, RunConfig
 from shac.envs import make_env
 from shac.models.networks import GaussianActor, Critic
+from shac.utils.checkpoints import read_checkpoint
 from shac.utils.running_stats import RunningMeanStd
 
 
@@ -158,9 +159,12 @@ def td_lambda_values(rew_buf: torch.Tensor,
 class SHACTrainer:
     """SHAC for a differentiable environment (paper Algorithm 1)."""
 
-    def __init__(self, env_cfg: EnvConfig, algo_cfg: SHACConfig,
+    def __init__(self, env_cfg: EnvConfigBase, algo_cfg: SHACConfig,
                  run_cfg: RunConfig, device: torch.device,
                  env_name: str = "cartpole", logger=None):
+        # NOTE on defaults: env_name keeps a "cartpole" default so old
+        # call sites (and the paper-faithful usage) keep working, but
+        # always pass it explicitly for the pendulum or any new env.
         self.env_cfg = env_cfg
         self.cfg = algo_cfg
         self.run_cfg = run_cfg
@@ -249,8 +253,10 @@ class SHACTrainer:
         self._window_ent_dual = 0.0
         self._window_ent_contrib = 0.0
 
-        # ---- diagnostics ----
+        # ---- loop state (advanced by train(), restored by load/resume) ----
         self.total_env_steps = 0
+        self._episode = 0                    # last COMPLETED learning episode
+        self._best_eval = -float("inf")
         # Task-episode returns completed since the last log row. Filled by
         # _rollout_and_update_actor; train() clears it after every row.
         self._completed_returns: List[float] = []
@@ -602,7 +608,13 @@ class SHACTrainer:
                 self.critic_opt.zero_grad()
                 loss.backward()
                 # Official "ugly fix": sanitize non-finite grads if the
-                # simulation ever produced NaN observations.
+                # simulation ever produced NaN observations. This is a
+                # DELIBERATE asymmetry with the actor path, which RAISES
+                # on non-finite gradients: a critic MSE spike (e.g. at the
+                # lockstep task resets, or the first episodes' fitting
+                # transient) is transient and absorbable, while a
+                # non-finite actor gradient means the rollout itself
+                # diverged and must not be silently trained through.
                 for p in self.critic.parameters():
                     if p.grad is not None:
                         p.grad.nan_to_num_(0.0)
@@ -631,10 +643,24 @@ class SHACTrainer:
     # ======================================================================
     # Main training loop
     # ======================================================================
-    def train(self) -> Dict[str, float]:
-        best_eval = -float("inf")
+    def train(self, resume: Optional[str] = None) -> Dict[str, float]:
+        """Run the full training loop (paper Algorithm 1).
 
-        for episode in range(1, self.cfg.num_episodes + 1):
+        resume: optional path to a checkpoint saved by this class -- restores
+        the actor/critic weights, optimizer states, observation statistics,
+        dual-tuned alpha, episode counter, env-step count and best-eval
+        tracker, then continues from the NEXT episode (LR schedule included,
+        since it is keyed on the absolute episode number). NOT restored: the
+        torch RNG stream and the simulator's physical state -- a resumed run
+        is statistically, not bit-wise, identical to an uninterrupted one.
+        """
+        if resume is not None:
+            self.load(resume)
+
+        best_eval = self._best_eval
+        for episode in range(self._episode + 1,
+                             self.cfg.num_episodes + 1):
+            self._episode = episode
             lr_actor, lr_critic = self._set_lrs(episode - 1)
 
             # ---- gradient-estimator variance (diagnostic) ----
@@ -696,6 +722,7 @@ class SHACTrainer:
             # ---- checkpointing ----
             if eval_mean is not None and eval_mean > best_eval:
                 best_eval = eval_mean
+                self._best_eval = best_eval
                 self.save(suffix="best_policy")
             if (self.run_cfg.save_interval > 0
                     and episode % self.run_cfg.save_interval == 0):
@@ -709,9 +736,25 @@ class SHACTrainer:
     # Evaluation: full task episodes with the deterministic policy
     # (mu, no noise), on a fresh environment so training state is untouched.
     # ======================================================================
-    @torch.no_grad()
     def evaluate(self, num_episodes: int) -> Tuple[float, float]:
-        if not hasattr(self, "_eval_env"):
+        """Deterministic-eval mean/std over `num_episodes` episodes.
+
+        Runs under `torch.random.fork_rng`: the eval env's initial-state
+        draws would otherwise consume the GLOBAL torch RNG that also feeds
+        the training rollouts, so changing --eval-interval or
+        --eval-episodes would silently change the training trajectory
+        itself. Forking saves/restores the RNG state around the eval,
+        making evaluation transparent to training (all RNG streams,
+        CPU and CUDA).
+        """
+        devices = [self.device] if self.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            return self._evaluate(num_episodes)
+
+    @torch.no_grad()
+    def _evaluate(self, num_episodes: int) -> Tuple[float, float]:
+        if (not hasattr(self, "_eval_env")
+                or self._eval_env.num_envs != num_episodes):
             self._eval_env = make_env(self.env_name, self.env_cfg,
                                       self.device, num_envs=num_episodes)
         env = self._eval_env
@@ -763,11 +806,26 @@ class SHACTrainer:
             # ignore it.
             "entropy_alpha": (float(self.entropy_alpha)
                               if self.max_entropy else None),
+            # ---- training-loop state (for --resume) ----
+            "episode": self._episode,
+            "total_env_steps": self.total_env_steps,
+            "best_eval_return": (None if self._best_eval == -float("inf")
+                                 else float(self._best_eval)),
         }, path)
         return path
 
     def load(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        """Restore weights, optimizer states, observation statistics, the
+        dual-tuned alpha, and the training-loop state (episode counter,
+        env-step count, best-eval tracker) written by save(). Older
+        checkpoints without the loop-state keys restore to a fresh loop.
+        NOT restored: the torch RNG stream and the simulator's physical
+        state (see train()'s resume note)."""
+        env_name, _, ckpt = read_checkpoint(path, self.device)
+        if env_name != self.env_name:
+            raise ValueError(
+                f"checkpoint env '{env_name}' does not match this "
+                f"trainer's env '{self.env_name}'")
         self.actor.load_state_dict(ckpt["actor"])
         self.actor_opt.load_state_dict(ckpt["actor_opt"])
         if self.obs_rms is not None and ckpt["obs_rms"] is not None:
@@ -784,6 +842,11 @@ class SHACTrainer:
         # the field entirely).
         if (self.max_entropy and ckpt.get("entropy_alpha") is not None):
             self.entropy_alpha = float(ckpt["entropy_alpha"])
+        # Training-loop state (absent in pre-resume checkpoints -> fresh).
+        self.total_env_steps = int(ckpt.get("total_env_steps", 0))
+        self._episode = int(ckpt.get("episode", 0))
+        best = ckpt.get("best_eval_return")
+        self._best_eval = (-float("inf") if best is None else float(best))
 
     # ======================================================================
     # Console output
@@ -813,6 +876,10 @@ class SHACTrainer:
 
 # ---------------------------------------------------------------------------
 # Tiny statistics helpers (numpy-free)
+# NOTE: population convention (divide by n) -- these describe the COMPLETED
+# episodes at hand. Across-seed summaries in scripts/plot_ablation.py use
+# the sample convention (ddof=1) instead: there the seeds are a sample of a
+# seed distribution whose spread is being ESTIMATED. Different estimands.
 # ---------------------------------------------------------------------------
 def _mean(xs: List[float]) -> float:
     return sum(xs) / len(xs)

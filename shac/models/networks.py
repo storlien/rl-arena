@@ -219,7 +219,13 @@ class GaussianActor(nn.Module):
         call -- i.e. the average exploration noise over the states of the
         episode just rolled out (SHACTrainer resets the accumulator at the
         start of every window, so probe windows never pollute it).
-        Deterministic eval calls are not accumulated."""
+        Deterministic eval calls are not accumulated.
+
+        NOTE the read-and-reset side effect (documented API, relied on by
+        SHACTrainer's logging), and that state mode returns 0.0 when no
+        stochastic call happened since the last reset -- the trainer only
+        ever calls std() right after a full window, which always contains
+        stochastic samples."""
         if not self.state_std:
             return float(self.logstd.exp().mean().item())
         if self._std_n == 0:
