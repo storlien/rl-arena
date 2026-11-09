@@ -264,12 +264,145 @@ maneuver whose basin is ~11.5° wide — an algorithm problem (or a reward
 that prices energy near E*, e.g. shaping toward E* = m·g·l), not a
 physics or horizon problem.
 
-### 5.4 Open levers (not yet run)
+### 5.4 Open levers (superseded — see section 6)
 
-* **σ₀ init**: `actor_logstd_init` −1.0 → −0.5 (σ₀ 0.37 → 0.61) without
-  entropy — widen early exploration on the task's own schedule instead
-  of the dual's.
-* **Multi-seed confirmation** of the baseline plateau (3–5 seeds) before
-  investing further.
-* Longer budget (1000+ episodes): the baseline was still inching up at
-  ep 500 (best at ep 480).
+* ~~σ₀ init~~: **run, null** (`runs/pend_highsig`, σ₀ = 1.0): identical
+  18.8% orbit. Exploration width was never the blocker.
+* ~~Multi-seed confirmation~~: done where it mattered (section 6).
+* Longer budget: superseded by the task-spec fix below.
+
+## 6. Resolving the plateau: the task spec was the bug, not the algorithm
+
+The question this section answers: the CartPole winners (V-style,
+V+h64, full SAPO) and the §5.3 diagnosis pointed away from the
+optimizer — what does it actually take to learn swing-up AND balance?
+
+### 6.1 Phase A — the CartPole winners do not transfer (predicted)
+
+Ported at H = 240, hanging init, seed 0:
+
+| arm | best | behavioral metrics | verdict |
+|---|---|---|---|
+| baseline | −1376.0 | 18.8% swing-up, t_up 227, 55.9° | plateau |
+| SHAC + V-style (`--activation silu --optimizer adamw`) | −1334.8 | 18.8%, t_up 227, 56.4° | same orbit |
+| SHAC + V-style + h64 | −1334.6 | 25.0%, t_up 224, 50.1° | same orbit |
+| full SAPO (all 5 choices) | −1440.3 | **0%** swing-up | entropy tax kills the pump |
+
+Exactly the CartPole lesson generalized: changes to the *learning
+machinery* buy speed on tasks already being solved, nothing on tasks
+that stall — and full SAPO's entropy is *actively harmful* on a
+timing-critical task (as in the §5.2 2×2).
+
+### 6.2 Phase B — attacking the real blocker: the capture basin
+
+The §5.3 diagnosis: capture requires arriving near-upright AND slow,
+inside an ~11.5° basin that hanging-init episodes essentially never
+sample. Three preregistered arms:
+
+| arm | change | prediction | result (seed 0) |
+|---|---|---|---|
+| `pend_upinit` | near-upright init θ~U(−π/4, π/4), ω~U(−0.5, 0.5) (`--init-mode upright`) | balance learned densely; swing-up untouched | **87.5% swing-up, 7.2° balance, best −180** on its init dist — balancing IS learnable |
+| `pend_enshape1` | energy-shaping penalty `r −= ((E−E*)/2mgl)²` (`--energy-shaping 1`) | orbit converts to capture attempts | **null** — 25% swing-up orbit, worse returns. The quadratic energy price adds no capture precision |
+| `pend_highsig` | σ₀ 0.37 → 1.0 (`--actor-logstd-init 0`) | wider exploration finds the basin | **null** — identical 18.8% orbit |
+| `pend_upinit_ft` | warm-start from `pend_upinit` best, fine-tune hanging | balance skill transfers | **fail** — skill decays without gradient support (12.5%, 57° orbit) |
+
+The upright-init probe is the load-bearing result: **the balance
+controller is learnable**; the hanging-init plateau simply never
+reinforces it. Naive two-stage fails because the fine-tune phase gives
+the balance skill zero gradient — all-or-nothing init distributions.
+
+### 6.3 The fix: gym's own init distribution (uniform over the circle)
+
+Our init choice was the repo's CartPole-style convention (§1 justified
+it as "every episode a genuine swing-up"). But gym's Pendulum-v1
+samples **θ ~ U(−π, π), ω ~ U(−1, 1)** — which is a *built-in
+curriculum*: every episode starting in/near the capture basin
+(~6.5% strictly inside ±11.5°, more within catchable range) gives the
+balance skill dense gradient, while far starts still demand the pump.
+`--init-mode uniform` restores exactly gym's distribution:
+
+| run (500 eps, H=240) | best | uniform-dist behavioral metrics |
+|---|---|---|
+| `pend_gyminit` seed 0 | −474.7 | 68.8% swing-up, t_up 95, **3.7°** balance |
+| seed 1 | −531.9 | 68.8%, t_up 94, 2.9° |
+| seed 2 | −511.5 | 68.8%, t_up 88, 18.7° |
+| + V-style seed 0 | −477.5 | 68.8% — V-style adds nothing here |
+
+**But from hanging starts these policies do NOT solve swing-up**:
+reach-and-hold 16.7–27.1% (baseline: 27.1%), arriving at t ≈ 227 of
+240 — the pump still consumes the whole 4 s episode (§5.3). Uniform
+init taught capture; the clock still forbids the full maneuver.
+
+### 6.4 Uniform init + the gym-spirit horizon: SOLVED
+
+`--init-mode uniform --ep-length 480` (8 s ≈ gym's 10 s at this repo's
+dt; the earlier hanging-init H=480 runs showed the horizon alone does
+nothing — both ingredients are needed):
+
+| run | best | uniform-dist metrics | **hanging-start eval** (48 eps) |
+|---|---|---|---|
+| seed 0 | −596.8 | 100% swing-up, t_up 110 | **100% reach+hold**, t_up 311/480, **0.1°** balance |
+| seed 1 | −630.8 | 100%, t_up 109 | **100%**, 299/480, 0.1° |
+| seed 2 | −413.1 | 100%, t_up 108 | **100%**, 295/480, 0.1° |
+
+Every seed solves the FULL task from genuine hanging starts: pump
+(~5 s), capture, then hold at **0.1°** — tighter than the
+hand-designed energy-shaping controller of §5.3 (which held 4.2 s at
+H=480). See
+`runs/pend_gyminit_H480_s0/hangingstart_rollout.gif`.
+
+### 6.5 What this does and doesn't claim
+
+* **The plateau was a task-spec artifact.** Plain SHAC (paper config,
+  no modifications) solves pendulum swing-up once the env spec matches
+  gym's — uniform-over-the-circle init + a ~10 s clock. Our two
+  "deliberate divergences from gym" (§1) were precisely the two things
+  that made the task unlearnable at this budget.
+* **The success bar is redefined behaviorally.** The old bar (last-5
+  eval ≥ −100, H=240 hanging evals) is unreachable under ANY spec
+  change: hanging starts cost ~1700+ return at H=480 before
+  accounting for the pump, and uniform evals mix start difficulties.
+  The honest criterion — which the winners now meet on every seed — is
+  100% reach-and-hold from hanging starts with a tight balance.
+* **What did NOT work** is part of the result: energy shaping (null),
+  σ₀ widening (null), naive two-stage transfer (skill decay), and the
+  entire SAPO-inspired machinery (null-to-harmful here). The lever was
+  neither the optimizer, the objective, the exploration width, nor the
+  reward — it was the task's init distribution and clock.
+* Curriculum insight worth keeping: a mixed init distribution acts as
+  a free curriculum for unstable-equilibrium tasks; an all-hanging
+  init makes the balancing sub-skill unobservable, and an all-upright
+  init makes it untransferable.
+
+### 6.6 Reproducing section 6
+
+```bash
+# phase A: the CartPole winners, ported unchanged (H=240, hanging init)
+uv run python -m shac.train --env pendulum --device cpu --threads 1 --seed 0 \
+    --activation silu --optimizer adamw
+uv run python -m shac.train --env pendulum --device cpu --threads 1 --seed 0 \
+    --activation silu --optimizer adamw --horizon 64
+uv run python -m shac.train --env pendulum --device cpu --threads 1 --seed 0 \
+    --max-entropy --state-std --critic-ensemble 2 --no-target-critic \
+    --actor-bootstrap-pool avg --activation silu --optimizer adamw --grad-clip 0.5
+
+# phase B: anti-plateau arms
+uv run python -m shac.train --env pendulum --device cpu --threads 1 --seed 0 \
+    --init-mode upright                        # balance-only curriculum
+uv run python -m shac.train --env pendulum --device cpu --threads 1 --seed 0 \
+    --energy-shaping 1.0                       # null
+uv run python -m shac.train --env pendulum --device cpu --threads 1 --seed 0 \
+    --actor-logstd-init 0.0                    # null
+uv run python -m shac.train --env pendulum --device cpu --threads 1 --seed 0 \
+    --resume runs/pend_upinit/best_policy.pt   # naive two-stage: fails
+
+# the fix (3 seeds): gym init + gym-spirit horizon
+for s in 0 1 2; do
+  uv run python -m shac.train --env pendulum --device cpu --threads 1 --seed $s \
+      --init-mode uniform --ep-length 480
+done
+
+# hanging-start honesty check + figures
+uv run python scripts/policy_metrics.py runs/pend_gyminit_H480_s0/best_policy.pt
+uv run python scripts/plot_training.py runs/pend_gyminit_H480_s0
+```

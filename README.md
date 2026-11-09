@@ -6,7 +6,11 @@ A small, self-contained, heavily-commented implementation of **SHAC**
 (Xu et al.), applied to its simplest benchmark task, **CartPole Swing-Up**
 (paper Appendix A.3.1), plus a second, structurally different environment,
 **Pendulum Swing-Up** (`--env pendulum`, not a paper task — see
-[PENDULUM.md](PENDULUM.md)).
+[PENDULUM.md](PENDULUM.md); §6 there: at the gym-faithful task spec
+(uniform init + ~10 s clock) plain SHAC **solves** the full
+swing-up-and-balance — 100% reach-and-hold from hanging starts,
+0.1° balance — which the repo's stricter CartPole-style spec made
+unlearnable at this budget).
 
 Everything — including the *differentiable simulator* — is plain PyTorch, so
 the code runs on **CPU or GPU** with no external simulation dependency, and
@@ -41,7 +45,9 @@ uv run python tests/test_max_entropy.py
 # train (CPU; ~2-5 minutes for the full 500 episodes on a laptop)
 uv run python -m shac.train --device cpu
 
-# second task: Pendulum Swing-Up (NOT a SHAC paper task -- see PENDULUM.md)
+# second task: Pendulum Swing-Up (NOT a SHAC paper task -- see PENDULUM.md;
+# add --init-mode uniform --ep-length 480 for the gym spec that section 6
+# shows is required to learn the full swing-up-and-balance at this budget)
 uv run python -m shac.train --env pendulum --device cpu
 
 # train on GPU instead (identical code; see "CPU vs GPU" below for the
