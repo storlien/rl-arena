@@ -13,10 +13,11 @@ Examples
     uv run python -m shac.train --device cpu --episodes 50
 
 Outputs are written to  runs/<env>_<timestamp>/
-    log.csv           one row per learning episode (plot with scripts/)
-    metadata.json     the full resolved configuration
-    best_policy.pt    checkpoint with the best evaluation return
-    final_policy.pt   checkpoint at the end of training
+    log.csv                  one row per learning episode (plot with scripts/)
+    metadata.json            the full resolved configuration
+    best_policy.pt           checkpoint with the best evaluation return
+    final_policy.pt          checkpoint at the end of training
+    interrupted_policy.pt    checkpoint after Ctrl-C (resumable via --resume)
 """
 
 import argparse
@@ -52,7 +53,16 @@ def parse_args() -> argparse.Namespace:
                         "Ignored on GPU.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--logdir", default=None,
-                   help="output directory (default: runs/<env>_<timestamp>)")
+                   help="output directory (default: runs/<env>_<timestamp>; "
+                        "an existing logdir's log.csv is never overwritten)")
+    p.add_argument("--resume", default=None, metavar="PATH",
+                   help="resume training from a checkpoint saved by this "
+                        "repo (weights, optimizer states, observation "
+                        "statistics, dual-tuned alpha, episode counter and "
+                        "best-eval tracker are restored; the RNG stream and "
+                        "the simulator state are NOT, so a resumed run is "
+                        "statistically but not bit-wise identical to an "
+                        "uninterrupted one)")
 
     # ---- the important algorithm knobs (defaults = paper Table 4) -------
     p.add_argument("--episodes", type=int, default=500,
@@ -126,8 +136,7 @@ def resolve_device(name: str) -> torch.device:
     if name == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
-        print("CUDA not available -- falling back to CPU "
-              "(fine for CartPole).")
+        print("CUDA not available -- falling back to CPU.")
         return torch.device("cpu")
     return torch.device(name)
 
@@ -174,25 +183,18 @@ def main() -> None:
     logdir = run_cfg.logdir or (
         "runs/" + args.env + "_"
         + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    # append=True when resuming: continue the run's log.csv (row schema
+    # and header come from the original run) instead of refusing to touch it.
     logger = RunLogger(logdir, meta={
         "env_name": args.env,
         "env": asdict(env_cfg),
         "algo": asdict(algo_cfg),
         "run": asdict(run_cfg),
         "device": str(device),
-    })
+    }, append=args.resume is not None)
 
-    task_banner = {
-        "cartpole": "CartPole Swing-Up (paper Appendix A.3.1)",
-        "pendulum": "Pendulum Swing-Up (Gym Pendulum-v1 spec; "
-                    "see PENDULUM.md -- not a SHAC paper task)",
-    }
-    task_reward = {
-        "cartpole": "reward = -theta^2 - 0.1*thd^2 - 0.05*x^2 - 0.1*xd^2",
-        "pendulum": "reward = -theta^2 - 0.1*thd^2 - 0.001*u^2 "
-                    "(u = torque)",
-    }
-    print(f"SHAC -- {task_banner[args.env]}")
+    spec = ENV_REGISTRY[args.env]
+    print(f"SHAC -- {spec.label}")
     print(f"  env         : {args.env}")
     print(f"  device      : {device}")
     print(f"  N x h       : {env_cfg.num_envs} x {algo_cfg.short_horizon} "
@@ -200,26 +202,43 @@ def main() -> None:
     print(f"  episodes M  : {algo_cfg.num_episodes}")
     print(f"  logdir      : {logdir}")
     print(f"  task        : H = {env_cfg.episode_length} steps, "
-          f"{task_reward[args.env]}")
+          f"{spec.reward_desc}")
     print(f"  critic      : "
           f"{'ON (full SHAC)' if algo_cfg.use_critic else 'OFF -- ablation: '
            'pathwise derivative only'}")
-    if algo_cfg.max_entropy:
-        print(f"  max-entropy : ON -- soft window return + soft td-(lambda) "
-              f"targets, dual-tuned alpha (target H = "
-              f"{-0.5 if algo_cfg.entropy_target is None else algo_cfg.entropy_target:+.2f}"
-              f" [-dim(A)/2 default, CartPole dim(A)=1], "
-              f"init alpha = {algo_cfg.entropy_init_alpha:g})")
+    if args.resume is not None:
+        print(f"  resume      : {args.resume}")
     print()
 
     trainer = SHACTrainer(env_cfg, algo_cfg, run_cfg, device,
                           env_name=args.env, logger=logger)
+    # The max-entropy banner line needs dim(A) for the default target; that
+    # is an env property, so it is printed here (after the trainer exists)
+    # rather than hardcoding "1 action dim" per env.
+    if algo_cfg.max_entropy:
+        target = (algo_cfg.entropy_target
+                  if algo_cfg.entropy_target is not None
+                  else -0.5 * trainer.num_actions)
+        print(f"  max-entropy : ON -- soft window return + soft td-(lambda) "
+              f"targets, dual-tuned alpha (target H = {target:+.2f} "
+              f"[-dim(A)/2 default, dim(A) = {trainer.num_actions}], "
+              f"init alpha = {algo_cfg.entropy_init_alpha:g})")
     try:
-        result = trainer.train()
+        result = trainer.train(resume=args.resume)
     except KeyboardInterrupt:
-        print("\nInterrupted -- saving current policy.")
-        trainer.save(suffix="final_policy")
+        # Distinct suffix: "final_policy" means the run COMPLETED its
+        # episode budget; an interrupt is a different artifact.
+        print("\nInterrupted -- saving current policy as "
+              "interrupted_policy.pt (resumable with --resume).")
+        trainer.save(suffix="interrupted_policy")
         return
+    except FileExistsError as e:
+        # The logger refuses to overwrite an existing run's log.csv; print
+        # its guidance cleanly instead of a traceback.
+        print(f"\nerror: {e}")
+        raise SystemExit(1) from e
+    finally:
+        logger.close()
     print(f"\nTraining finished. Best eval return: "
           f"{result['best_eval_return']:.1f}")
     print(f"Artifacts in: {logdir}")
