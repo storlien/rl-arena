@@ -1,22 +1,37 @@
-# SHAC — Short-Horizon Actor-Critic (CartPole Swing-Up + Pendulum)
+# rl-arena — a testbed for short-horizon gradient RL
 
-A small, self-contained, heavily-commented implementation of **SHAC**
-(Short-Horizon Actor-Critic) from the ICLR 2022 paper
-[*Accelerated Policy Learning with Parallel Differentiable Simulation*](https://short-horizon-actor-critic.github.io/)
-(Xu et al.), applied to its simplest benchmark task, **CartPole Swing-Up**
-(paper Appendix A.3.1), plus a second, structurally different environment,
-**Pendulum Swing-Up** (`--env pendulum`, not a paper task — see
-[PENDULUM.md](PENDULUM.md); §6 there: at the gym-faithful task spec
-(uniform init + ~10 s clock) plain SHAC **solves** the full
-swing-up-and-balance — 100% reach-and-hold from hanging starts,
-0.1° balance — which the repo's stricter CartPole-style spec made
-unlearnable at this budget). The solved policy's hanging-start rollout:
+A small, self-contained arena for **implementing and benchmarking
+short-horizon, backprop-through-dynamics RL algorithms** against each
+other on small control tasks — every comparison preregistered
+(predictions written before the run), run single-seed first with
+3-seed confirmation for winners, and documented in a dedicated
+write-up per experiment with rollout GIFs of every best policy.
+
+**The residents so far:**
+
+| solver | status | write-up |
+|---|---|---|
+| **SHAC** (Short-Horizon Actor-Critic, ICLR 2022) | the founding implementation — heavily commented, faithful to the official config | this README + "The algorithm in five stages" below |
+| **SAPO** (ICLR 2025) | full faithful reimplementation (all 5 design choices) — clean negative vs SHAC+V-style on CartPole | [BEAT_BASELINE.md](BEAT_BASELINE.md) |
+| **AHAC** (ICML 2024) | faithful reimplementation incl. two code-vs-paper discrepancies — the horizon ratchet is the entire degradation | [AHAC.md](AHAC.md) |
+| SHAC ablations & SAC-style variants | no-critic, state-σ(s), max-entropy dual, … | [ABLATION.md](ABLATION.md), [STATE_STD.md](STATE_STD.md), [MAX_ENTROPY.md](MAX_ENTROPY.md) |
+
+**The tasks:**
+
+| env | spec | status |
+|---|---|---|
+| **CartPole Swing-Up** (SHAC paper Appendix A.3.1) | repo's CartPole-style init, H = 240 steps | all solvers learn it; differences are pure efficiency |
+| **Pendulum Swing-Up** (`--env pendulum`, not a paper task) | gym-faithful: uniform init + ~10 s clock (`--init-mode uniform --ep-length 480`) | plain SHAC **solves** it — 100% reach-and-hold from hanging starts, 0.1° balance ([PENDULUM.md](PENDULUM.md) §6) |
+
+The Pendulum's solved policy from a genuine hanging start:
 
 ![Pendulum solved from a hanging start: pump, capture, hold at 0.1 degrees](figures/rollout_pend_gyminit_H480_s0.gif)
 
-Everything — including the *differentiable simulator* — is plain PyTorch, so
-the code runs on **CPU or GPU** with no external simulation dependency, and
-every file is written to be read top-to-bottom.
+The Python package is (and stays) named `shac` — the SHAC trainer is
+the backbone every variant is built from. Everything — including the
+*differentiable simulator* — is plain PyTorch, so the code runs on
+**CPU or GPU** with no external simulation dependency, and every file
+is written to be read top-to-bottom.
 
 ---
 
@@ -538,3 +553,13 @@ network; CEM/MPPI only need forward rolls (wrap `step()` in `no_grad`). The
   `eval_return_mean` around episode 30-100.
 * **Want faster training?** Increase `--num-envs` (and move to GPU), or
   raise `--eval-interval` to evaluate less often.
+
+---
+
+## History
+
+This repository was previously named `shac-implementation`; it was
+renamed to **rl-arena** when its scope grew from "a SHAC
+reimplementation" to "a benchmarking arena for several algorithms"
+(SAPO, AHAC, and the ablation family joined). GitHub redirects the old
+URL, and all git history is unchanged.
