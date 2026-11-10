@@ -10,7 +10,9 @@ A small, self-contained, heavily-commented implementation of **SHAC**
 (uniform init + ~10 s clock) plain SHAC **solves** the full
 swing-up-and-balance — 100% reach-and-hold from hanging starts,
 0.1° balance — which the repo's stricter CartPole-style spec made
-unlearnable at this budget).
+unlearnable at this budget). The solved policy's hanging-start rollout:
+
+![Pendulum solved from a hanging start: pump, capture, hold at 0.1 degrees](figures/rollout_pend_gyminit_H480_s0.gif)
 
 Everything — including the *differentiable simulator* — is plain PyTorch, so
 the code runs on **CPU or GPU** with no external simulation dependency, and

@@ -95,6 +95,8 @@ delta is isolated against the same baseline.
 
 ### 4.1 CartPole (paper task; baseline best −274.0/−323.4/−323.8, mean −307.1)
 
+Rollouts of every arm's best policy (deterministic; 0.83× real-time):
+
 | arm | best eval | behavior (16-ep deterministic) | verdict |
 |---|---|---|---|
 | `cp_ahac_full` | −541.5 | 100% swing-up, t_up 78, 4.5° | **P1 confirmed** — solves the task, but the h = 8 ratchet costs ~2× the return (t_up 78 vs 67–72 baseline) |
@@ -105,12 +107,30 @@ All three still solve CartPole (100% swing-up) — the ordering is pure
 efficiency, and the ladder cleanly decomposes the loss: the horizon
 ratchet is everything, the critics are nothing (on this task).
 
+| baseline (h = 32) | AHAC full (h = 8) | horizon-only (h = 8) | no-horizon (h = 32) |
+|---|---|---|---|
+| ![baseline](figures/rollout_cp_base.gif) | ![AHAC full](figures/rollout_cp_ahac_full.gif) | ![horizon-only](figures/rollout_cp_ahac_horizon.gif) | ![no-horizon](figures/rollout_cp_ahac_nohorizon.gif) |
+
+The h = 8 pair visibly pump longer and wobble wider before capture;
+the two h = 32 arms are near-identical to each other and to the baseline.
+
 ### 4.2 Pendulum, gym spec (uniform init + H = 480; baseline: 100% hanging-start reach-and-hold on 3 seeds, t_up 299–311, 0.1° balance)
+
+All rollouts below are from **genuine hanging starts** (the honest
+full-task test):
 
 | arm | eval best / last5 | **hanging-start eval** (48 genuine swing-ups) | verdict |
 |---|---|---|---|
 | `pend_ahac_full` (H pinned at 8) | −578.4 / −1042 | **97.9%** reach+hold, t_up 340, 0.1° | **P4 refuted in its strong form** — even the crippled h = 8 nearly solves the full task |
 | `pend_h128` (fixed h = 128) | −578.7 / −865 | **100%**, **t_up 296** (fastest of all arms), 0.1°; uniform-dist balance **3.5°** (baseline s0: 14.7°) | **P5 confirmed** — the timescale-matched horizon is the best pendulum policy we have measured (3-seed confirmation: §4.3) |
+
+| baseline (h = 32, t_up 311) | AHAC full (h = 8, t_up 340) | h = 128 (t_up 296) |
+|---|---|---|
+| ![baseline](figures/rollout_pend_gyminit_H480_s0.gif) | ![AHAC full h8](figures/rollout_pend_ahac_full.gif) | ![h128](figures/rollout_pend_h128.gif) |
+
+Same 0.1° final balance in all three; the h = 8 policy visibly spends
+~30 extra steps pumping before it dares to capture; the h = 128 policy
+captures earliest.
 
 P4's refutation is the more interesting result: the uniform-init
 curriculum (PENDULUM.md §6) is so effective that plain SHAC's machinery

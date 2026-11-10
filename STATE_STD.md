@@ -119,6 +119,14 @@ AHEAD mid-training (episodes 140–260, e.g. -427 vs -957 at ep 160) because
 slowly-decaying sigma grinds on to -274. Raw curves and the four-panel
 figure: `figures/state_std_ab.png`.
 
+Rollouts of the two best policies (seed 0, deterministic — at eval the
+sigma modes do not act, so both show the same solved swing-up; the A/B
+differences live in the TRAINING exploration, not the final behavior):
+
+| global sigma | state sigma(s) |
+|---|---|
+| ![global](figures/rollout_std_global.gif) | ![state](figures/rollout_std_state.gif) |
+
 ### Exploration width: the collapse
 
 `policy_std` trajectories (log scale, figure panel b): the global

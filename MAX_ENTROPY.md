@@ -161,6 +161,14 @@ protocol — the sign of the result is what we preregistered against.
 | first eval > −400 | ep 110 | ep 360 | ep 240 | ep 210 |
 | evals ahead of plain global | — | — | 19/50 | 13/50 |
 
+Rollouts of the 2×2's best policies (seed 0, deterministic, 0.83×
+real-time — all four solve the task; the A/B is about training
+exploration, not final behavior):
+
+| global | state | global+ent | state+ent |
+|---|---|---|---|
+| ![global](figures/rollout_std_global.gif) | ![state](figures/rollout_std_state.gif) | ![global+ent](figures/rollout_std_ent_global.gif) | ![state+ent](figures/rollout_std_ent_state.gif) |
+
 Reading the curves (figure panel a): the entropy arms are competitive
 early — global+ent is ahead of the plain global at 19 of 50 evals —
 but the plain global's steadily-annealing σ grinds past them after
@@ -232,6 +240,13 @@ the pendulum prediction ("wider floor ⇒ worse") — **refuted**:
 (`runs/ent_{global,state}_t00_500ep/`; behavioral metrics from
 `scripts/policy_metrics.py`, 16 deterministic episodes per best
 checkpoint.)
+
+Rollouts of the two t = 0.0 arms' best policies (the four other arms'
+rollouts are in the galleries above):
+
+| global+ent t = 0.0 | state+ent t = 0.0 |
+|---|---|
+| ![global t00](figures/rollout_ent_global_t00.gif) | ![state t00](figures/rollout_ent_state_t00.gif) |
 
 1. **All six arms solve CartPole** (100% swing-up, ~3° balance). The
    entropy dose changes the *speed*, never the *outcome*, on this task.
@@ -333,6 +348,14 @@ gets sampled and reinforced.
 
 (swing-up = fraction of deterministic-eval steps within 14° of upright;
 0% means the best policy never reaches the top region at all.)
+
+Rollouts of every arm's best policy — the orbit vs. capture contrast is
+the whole story: the baseline passes through the top 18.8% of the time,
+every entropy arm orbits below it (0%):
+
+| baseline (no entropy) | global, t = −0.5 | global, t = 0.0 | state, t = −0.5 | state, t = 0.0 |
+|---|---|---|---|---|
+| ![baseline](figures/rollout_pend_baseline.gif) | ![g t-05](figures/rollout_pend_ent_global_t-05.gif) | ![g t00](figures/rollout_pend_ent_global_t00.gif) | ![s t-05](figures/rollout_pend_ent_state_t-05.gif) | ![s t00](figures/rollout_pend_ent_state_t00.gif) |
 
 Three findings:
 

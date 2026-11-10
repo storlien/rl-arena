@@ -191,6 +191,15 @@ over the final 60 steps of the episode):
 s3 96.9%/7.9°; s4 100%/17.3°. n=3 = the three seeds with any successful
 episode.)
 
+Rollouts of each arm's best policy (seed 0, deterministic, 0.83×
+real-time) — the A/B contrast is the sharpest result, visible directly:
+B arrives at the top and cannot hold it, D doubles the window and holds
+it like A:
+
+| **A** SHAC (h=32) | **B** no critic (h=32) | **C** no critic (h=240) | **D** no critic (h=64) |
+|---|---|---|---|
+| ![A](figures/rollout_abl_a_shac.gif) | ![B](figures/rollout_abl_b_nocritic.gif) | ![C](figures/rollout_abl_c_bptt240.gif) | ![D](figures/rollout_abl_d_h64.gif) |
+
 This is the sharpest result of the ablation: **B reaches upright in 85% of
 episodes but then wobbles at ~32° — it swings up but cannot balance.**
 D doubles the window and the wobble disappears (3.4°, statistically A's

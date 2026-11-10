@@ -170,7 +170,13 @@ A horizon sweep (`runs/pendulum_h{16,64,128}`, best −1360…−1376 each)
 shows the plateau is **h-invariant**, and the σ anneal 0.36 → 0.17 is
 too — by the time the link reaches the top region reliably, exploration
 has shrunk to ~0.17 and the capture maneuver is never sampled enough to
-be reinforced.
+be reinforced. Rollouts of the sweep's best policies — the same orbit
+at every window length (h = 64's GIF is in the run dir; the s0 baseline
+orbit is in the §5.2 gallery):
+
+| h = 16 | h = 128 |
+|---|---|
+| ![h16](figures/rollout_pend_h16.gif) | ![h128](figures/rollout_pend_h128_plateau.gif) |
 
 ### 5.2 The maximum-entropy arms (preregistered 2×2)
 
@@ -250,12 +256,13 @@ H = 480 (500 eps, else paper config, `runs/pendulum_H480_s{0,1,2}`):
 best −1327/−1380/−1330, and the behavioral metrics are IDENTICAL to the
 H = 240 plateau — swing-up fraction 18.8% on all seeds, t_up ≈ 224,
 balance ≈ 57–60°. The policies reach the top at the same ~3.7 s and
-then orbit through the extra 4 s (see
-`runs/pendulum_H480_s0/best_policy_rollout.gif`). The task is solvable
+then orbit through the extra 4 s. The task is solvable
 at H = 480 — the hand controller proves it — but the capture maneuver
 (arriving near-upright AND slow, inside an ~11.5° basin) is never
 sampled and reinforced: orbiting is a locally flat optimum whose reward
 gradient does not point at the precise deceleration.
+
+![The H=480 hanging-init orbit: reaches the top, never captures](figures/rollout_pend_H480.gif)
 
 **Conclusion.** The H = 240 horizon made capture physically impossible
 and the orbit optimal; H = 480 makes capture possible but learning
@@ -293,6 +300,14 @@ machinery* buy speed on tasks already being solved, nothing on tasks
 that stall — and full SAPO's entropy is *actively harmful* on a
 timing-critical task (as in the §5.2 2×2).
 
+Rollouts of each arm's best policy (H = 240, hanging init — every
+episode a genuine swing-up; the orbit is visible in all four: through
+the top, never capturing):
+
+| baseline | SHAC + V-style | SHAC + V-style + h64 | full SAPO |
+|---|---|---|---|
+| ![baseline](figures/rollout_pend_baseline.gif) | ![V](figures/rollout_pend_v.gif) | ![V+h64](figures/rollout_pend_vh64.gif) | ![SAPO](figures/rollout_pend_sapo_full.gif) |
+
 ### 6.2 Phase B — attacking the real blocker: the capture basin
 
 The §5.3 diagnosis: capture requires arriving near-upright AND slow,
@@ -310,6 +325,21 @@ The upright-init probe is the load-bearing result: **the balance
 controller is learnable**; the hanging-init plateau simply never
 reinforces it. Naive two-stage fails because the fine-tune phase gives
 the balance skill zero gradient — all-or-nothing init distributions.
+
+Rollouts of the Phase-B arms' best policies (each on its own init
+distribution — `pend_upinit` shows the balance-only skill its init
+trains; the other two are hanging-init orbits like §6.1):
+
+| `pend_upinit` (upright init) | `pend_enshape1` (hanging, +energy shaping) | `pend_highsig` (hanging, σ₀ = 1.0) |
+|---|---|---|
+| ![upinit](figures/rollout_pend_upinit.gif) | ![enshape](figures/rollout_pend_enshape1.gif) | ![highsig](figures/rollout_pend_highsig.gif) |
+
+And the naive two-stage transfer (`pend_upinit_ft`, warm-started from
+`pend_upinit` then fine-tuned hanging): after 230 hanging-init episodes
+the balance skill has decayed back into the orbit — the failure is
+visible, not just numeric:
+
+![Two-stage transfer: the balance skill decays without gradient support](figures/rollout_pend_upinit_ft.gif)
 
 ### 6.3 The fix: gym's own init distribution (uniform over the circle)
 
@@ -350,8 +380,18 @@ nothing — both ingredients are needed):
 Every seed solves the FULL task from genuine hanging starts: pump
 (~5 s), capture, then hold at **0.1°** — tighter than the
 hand-designed energy-shaping controller of §5.3 (which held 4.2 s at
-H=480). See
-`runs/pend_gyminit_H480_s0/hangingstart_rollout.gif`.
+H=480). The winner's hanging-start rollout (seed 0, from a genuine
+swing-up):
+
+![The solved policy from a hanging start](figures/rollout_pend_gyminit_H480_s0.gif)
+
+And for contrast, the §6.3 policies at H = 240 — they capture from
+moderate starts but, from hanging starts, still orbit (the clock runs
+out; §6.3's hanging-start evals):
+
+| `pend_gyminit` (uniform, H=240, seed 0) | `pend_gyminit_v` (uniform + V-style, H=240) |
+|---|---|
+| ![gyminit](figures/rollout_pend_gyminit.gif) | ![gyminit_v](figures/rollout_pend_gyminit_v.gif) |
 
 ### 6.5 What this does and doesn't claim
 

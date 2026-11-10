@@ -61,6 +61,13 @@ moderate λ are load-bearing. h = 64 ties on best but lands a clearly
 better last-5 with lower scatter — the hint that h matters, picked up
 in tier 3.
 
+Rollouts of each arm's best policy (deterministic, 0.83× real-time —
+all still solve the task; the differences are efficiency and style):
+
+| baseline | `cp_polyak0995` | `cp_tdl098` | `cp_tdl090` | `cp_h64` | `cp_n128` |
+|---|---|---|---|---|---|
+| ![baseline](figures/cartpole_500ep_rollout.gif) | ![polyak0995](figures/rollout_cp_polyak0995.gif) | ![tdl098](figures/rollout_cp_tdl098.gif) | ![tdl090](figures/rollout_cp_tdl090.gif) | ![h64](figures/rollout_cp_h64.gif) | ![n128](figures/rollout_cp_n128.gif) |
+
 ### Tier 2 — architecture/optimizer arms (new config-gated code)
 
 | arm | change | inspiration | prediction | best eval | verdict |
@@ -85,6 +92,10 @@ critic compute for a min-bias the fast Polyak target apparently already
 controls, and the warmup starves the actor of 10 of its 500 updates in a
 regime that is update-limited, not data-limited.
 
+| `cp_warmup10` | `cp_shac_sapoiv` | `cp_shac_sapov` (winner) |
+|---|---|---|
+| ![warmup10](figures/rollout_cp_warmup10.gif) | ![sapoiv](figures/rollout_cp_sapoiv.gif) | ![sapov](figures/rollout_cp_sapov.gif) |
+
 ### Tier 3 — the winner, confirmed over seeds
 
 | arm | seed 0 | seed 1 | seed 2 | mean best | mean last-5 |
@@ -103,6 +114,10 @@ behavior, exactly matching the "budget gap" framing.)
 The seed separation is complete: every V-style seed and every
 V-style+h64 seed beats every baseline seed. The winner's worst seed
 (−261.8) still beats the baseline's best seed (−274.0).
+
+| SHAC + V-style (seed 0) | **SHAC + V-style + h = 64 (seed 0, winner)** |
+|---|---|
+| ![sapov](figures/rollout_cp_sapov.gif) | ![sapov_h64](figures/rollout_cp_sapov_h64.gif) |
 
 ### Full SAPO — the faithful reimplementation, tested alongside
 
@@ -147,6 +162,11 @@ though full SAPO (with faithful pooling) still underperforms V alone,
 which bounds IV's contribution here; (ii) SAPO's published wins are on
 massively-parallel GPU tasks where SHAC stalls — a regime our toy
 budget deliberately does not reproduce.
+
+Rollout of full SAPO's best policy (seed 0) — behaviorally it is a
+slower, more conservative version of the same solved swing-up:
+
+![full SAPO best policy](figures/rollout_cp_sapo_full.gif)
 
 ## Interpretation
 
