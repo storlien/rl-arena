@@ -284,6 +284,24 @@ network/optimizer stack was the headroom. Pass `--activation silu
 `--grad-clip`, or everything together with the full-SAPO command in the
 doc) to try it yourself.
 
+### Benchmarking AHAC (adaptive horizon; the contact-free boundary)
+
+[AHAC.md](AHAC.md) benchmarks a third paper — AHAC (Georgiev et al.,
+ICML 2024), SHAC plus an adaptive window length driven by a Lagrangian
+dual on contact stiffness — against the same baselines. On contact-free
+tasks the dual has nothing to push against: the constraint never binds,
+the unclamped λ ratchets the window to its floor (h = 8, logged
+evidence in the doc) and full AHAC loses ~2× return on CartPole while
+the secondary components (double critic, iterative critic) land exactly
+on the baseline. The interesting survivors: the pendulum's pump-period
+timescale argument — realized as `--horizon 128` on the gym-spec
+pendulum — produces the fastest, tightest policy in this repo (100%
+hanging-start reach-and-hold, t_up 296/480, 0.1° balance), and even
+h = 8 nearly solves it, because the task-spec curriculum of
+[PENDULUM.md](PENDULUM.md) §6 dominates everything. Pass `--ahac` (or
+the individual `--adaptive-horizon` / `--double-critic` /
+`--iterative-critic` knobs) to try it yourself.
+
 ---
 
 ## Repository layout (suggested reading order)
@@ -308,6 +326,11 @@ BEAT_BASELINE.md                 the beat-the-baseline sweep write-up
                                   V-style + h=64 wins over 3 seeds; a
                                   full faithful SAPO reimplementation
                                   tested alongside lands in between)
+AHAC.md                          the AHAC benchmark write-up (adaptive
+                                  horizon dual on contact-free tasks:
+                                  the Prediction-0 ratchet, the ladder
+                                  decomposition, the h=128 timescale
+                                  winner)
 PENDULUM.md                      the second task's write-up: Pendulum
                                   Swing-Up (Gym task spec + repo
                                   simulation conventions; not a paper
