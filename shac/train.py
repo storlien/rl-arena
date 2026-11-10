@@ -111,6 +111,42 @@ def parse_args() -> argparse.Namespace:
                         "window loss when --critic-ensemble > 1: 'min' "
                         "(pessimistic) or 'avg' (SAPO's paper: average in "
                         "the actor return, min only for critic targets)")
+    # ---- AHAC-INSPIRED knobs (Georgiev et al., ICML 2024; all default to
+    # ---- native SHAC behavior). Repo naming: single knobs = "SHAC +
+    # ---- AHAC-inspired <component>"; --ahac (all three) = "AHAC".
+    p.add_argument("--adaptive-horizon", action="store_true",
+                   help="AHAC delta 1: adapt the window length H every "
+                        "episode via the Lagrangian dual on contact "
+                        "stiffness (paper Eq. 9-10). H starts at "
+                        "--steps-min and is clipped to [--steps-min, "
+                        "--steps-max]. WARNING (AHAC.md): on contact-free "
+                        "tasks the dual ratchets H to steps_min")
+    p.add_argument("--steps-min", type=int, default=8, metavar="HMIN",
+                   help="AHAC: initial/minimum adaptive window (official 8)")
+    p.add_argument("--steps-max", type=int, default=64, metavar="HMAX",
+                   help="AHAC: maximum adaptive window (official 64)")
+    p.add_argument("--contact-threshold", type=float, default=500.0,
+                   metavar="C",
+                   help="AHAC: stiffness threshold C (official 500)")
+    p.add_argument("--lambd-lr", type=float, default=5e-4, metavar="LR",
+                   help="AHAC: dual step size for (lambda, H); decays "
+                        "linearly to 1e-5 like the network LRs (official)")
+    p.add_argument("--double-critic", action="store_true",
+                   help="AHAC delta 2: two independent online critics, "
+                        "min-pooled bootstrap, NO Polyak target network. "
+                        "Implemented as critic_ensemble=2 + "
+                        "use_target_critic=False + pool=min (the same "
+                        "mechanism as SAPO's design choice IV)")
+    p.add_argument("--iterative-critic", action="store_true",
+                   help="AHAC delta 3: train the critic to convergence "
+                        "EVERY episode (up to 64 passes, early stop when "
+                        "the last five pass losses flatline < 0.2) instead "
+                        "of native SHAC's fixed 16 passes")
+    p.add_argument("--ahac", action="store_true",
+                   help="the FULL AHAC algorithm = --adaptive-horizon + "
+                        "--double-critic + --iterative-critic (Georgiev et "
+                        "al., ICML 2024). Use the individual flags for "
+                        "ablations")
     p.add_argument("--init-mode", default="hanging",
                    choices=["hanging", "uniform", "upright"],
                    help="PENDULUM ONLY: initial-state distribution -- "
@@ -207,6 +243,21 @@ def main() -> None:
         env_cfg.energy_shaping = args.energy_shaping
     if args.ep_length is not None:
         env_cfg.episode_length = args.ep_length
+    # ---- AHAC-INSPIRED composites ----------------------------------------
+    # --double-critic (AHAC delta 2) needs no new trainer code: it is exactly
+    # the SAPO-inspired choice-IV combination (two online critics, min-pooled
+    # bootstrap, no Polyak target). Explicit flags win over the composite.
+    if args.double_critic:
+        args.critic_ensemble = 2
+        args.no_target_critic = True
+        args.actor_bootstrap_pool = "min"
+    # --ahac = ALL THREE AHAC deltas together (the naming convention: this
+    # -- and only this -- is "AHAC"; single knobs are "SHAC + AHAC-inspired
+    # <component>").
+    if args.ahac:
+        args.adaptive_horizon = True
+        args.iterative_critic = True
+        args.double_critic = True
     algo_cfg = SHACConfig(
         short_horizon=args.horizon,
         num_episodes=args.episodes,
@@ -229,6 +280,13 @@ def main() -> None:
         activation=args.activation,
         optimizer=args.optimizer,
         grad_norm_clip=args.grad_clip,
+        # AHAC-INSPIRED switches (defaults = native SHAC behavior)
+        horizon_mode=("adaptive" if args.adaptive_horizon else "fixed"),
+        steps_min=args.steps_min,
+        steps_max=args.steps_max,
+        contact_threshold=args.contact_threshold,
+        lambd_lr=args.lambd_lr,
+        iterative_critic=args.iterative_critic,
     )
     run_cfg = RunConfig(
         seed=args.seed,
@@ -263,8 +321,9 @@ def main() -> None:
     print(f"SHAC -- {spec.label}")
     print(f"  env         : {args.env}")
     print(f"  device      : {device}")
-    print(f"  N x h       : {env_cfg.num_envs} x {algo_cfg.short_horizon} "
-          f"({env_cfg.num_envs * algo_cfg.short_horizon} env-steps/episode)")
+    print(f"  N x h       : {env_cfg.num_envs} x "
+          f"{algo_cfg.steps_min if algo_cfg.horizon_mode == 'adaptive' else algo_cfg.short_horizon} "
+          f"({env_cfg.num_envs * (algo_cfg.steps_min if algo_cfg.horizon_mode == 'adaptive' else algo_cfg.short_horizon)} env-steps/episode)")
     print(f"  episodes M  : {algo_cfg.num_episodes}")
     print(f"  logdir      : {logdir}")
     print(f"  task        : H = {env_cfg.episode_length} steps, "
@@ -272,6 +331,17 @@ def main() -> None:
     print(f"  critic      : "
           f"{'ON (full SHAC)' if algo_cfg.use_critic else 'OFF -- ablation: '
            'pathwise derivative only'}")
+    # AHAC-INSPIRED banner: which of the three deltas are active.
+    ahac_deltas = [
+        ("adaptive-horizon", algo_cfg.horizon_mode == "adaptive"),
+        ("double-critic", args.double_critic),
+        ("iterative-critic", algo_cfg.iterative_critic),
+    ]
+    if any(on for _, on in ahac_deltas):
+        on = [name for name, flag in ahac_deltas if flag]
+        label = "FULL AHAC" if len(on) == 3 else "SHAC + AHAC-inspired: "
+        print(f"  ahac        : {label}{', '.join(on) if len(on) < 3 else ''}"
+              f"{' [steps ' + str(algo_cfg.steps_min) + '..' + str(algo_cfg.steps_max) + ', C=' + str(algo_cfg.contact_threshold) + ', lam_lr=' + str(algo_cfg.lambd_lr) + ']' if algo_cfg.horizon_mode == 'adaptive' else ''}")
     if args.resume is not None:
         print(f"  resume      : {args.resume}")
     print()

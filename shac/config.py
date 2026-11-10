@@ -377,6 +377,57 @@ class SHACConfig:
     # before entering the actor loss and the critic targets
     # (their design choice II); the dual step uses the RAW entropy.
 
+    # --- AHAC-INSPIRED switches (Georgiev et al., "Adaptive Horizon
+    #     Actor-Critic", ICML 2024) ------------------------------------------
+    # NAMING (repo convention, same as the SAPO switches above): an arm that
+    # flips ONE of these switches is reported as "SHAC + AHAC-inspired
+    # <component>"; only the FULL combination (train.py --ahac = adaptive
+    # horizon + double critic + iterative critic) is called "AHAC".
+    # Everything above this line is native SHAC (paper Table 4 + the
+    # official NVlabs/DiffRL implementation) or clearly-marked SAPO/other
+    # inspiration; everything in this block exists to benchmark AHAC.
+    horizon_mode: str = "fixed"
+    # "fixed" (native SHAC): the window length is short_horizon, constant.
+    # "adaptive" (AHAC delta 1): the window length H adapts every episode by
+    #   a Lagrangian dual on the envs' contact stiffness (their Eq. 9-10).
+    #   H starts at steps_min and is clipped to [steps_min, steps_max] --
+    #   official ahac.yaml: 8 and 64. The constraint is "stiffness <= C on
+    #   every step of the window"; NOTE (verified against the official code,
+    #   NOT visible in the paper's equations): the dual variable lambda
+    #   NEVER enters the actor loss -- the constraint acts exclusively
+    #   through the H update. See AHAC.md for the contact-free collapse
+    #   analysis (on contact-free tasks lambda drifts negative unboundedly
+    #   and H ratchets to steps_min).
+    steps_min: int = 8
+    # AHAC: initial and minimum window length (official ahac.yaml).
+    steps_max: int = 64
+    # AHAC: maximum window length (official ahac.yaml). Note the native
+    # SHAC default (short_horizon = 32) sits inside this bracket.
+    contact_threshold: float = 500.0
+    # AHAC: the stiffness threshold C in "stiffness <= C" (official
+    # ahac.yaml contact_threshold: 500), in units of the env's normalized
+    # contact force -- see DifferentiableEnv.stiffness.
+    lambd_lr: float = 5e-4
+    # AHAC: dual step size for (lambda, H) (official lambd_lr), decayed
+    # linearly to lambd_lr_final over training exactly like the actor/critic
+    # learning rates (official lr_schedule: linear).
+    lambd_lr_final: float = 1e-5
+    # AHAC: the dual step size's decay target (official: (1e-5 - lambd_lr)
+    # * epoch / max_epochs + lambd_lr).
+    iterative_critic: bool = False
+    # AHAC delta 3 (their "double critic ... trained until convergence"):
+    # instead of native SHAC's FIXED critic_iterations passes every episode,
+    # train the critic up to iterative_critic_max passes with EARLY STOPPING
+    # when the pass losses flatline: |mean(diff(last 5 pass losses))| < tol
+    # (official: critic_iterations=None, max 64, tol 2e-1, window 5).
+    iterative_critic_max: int = 64
+    iterative_critic_tol: float = 0.2
+    # (The AHAC delta 2 "double critic" needs NO new field: it is exactly
+    # critic_ensemble=2 + use_target_critic=False + actor_bootstrap_pool=
+    # "min" -- two independent min-pooled online critics, no Polyak target
+    # -- which the SAPO-inspired switches above already implement. train.py
+    # --double-critic / --ahac set those three fields.)
+
     # --- ablation ------------------------------------------------------------
     use_critic: bool = True
     # Ablation switch (--no-critic): when False, the actor loss is ONLY the
@@ -399,6 +450,16 @@ class SHACConfig:
         assert 0 < self.td_lambda <= 1.0
         assert self.short_horizon >= 2
         assert self.critic_num_batch >= 1
+        # AHAC-inspired validation (horizon_mode etc. -- see the AHAC block)
+        if self.horizon_mode not in ("fixed", "adaptive"):
+            raise ValueError(f"unknown horizon_mode '{self.horizon_mode}' "
+                             "(fixed | adaptive)")
+        if self.horizon_mode == "adaptive":
+            assert self.steps_max > self.steps_min > 0
+            assert self.contact_threshold >= 0.0
+            assert self.lambd_lr >= self.lambd_lr_final > 0.0
+            assert self.iterative_critic_max >= 1
+            assert self.iterative_critic_tol > 0.0
 
 
 # ---------------------------------------------------------------------------

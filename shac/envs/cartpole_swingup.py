@@ -172,13 +172,7 @@ class CartPoleSwingUpEnv(DifferentiableEnv):
         #   if x < -limit: f = k*( -limit - x) > 0  (pushes right)
         #   if x > +limit: f = k*( +limit - x) < 0  (pushes left)
         # plus a damping term opposing the velocity while engaged.
-        violation = torch.where(
-            x < -self.cfg.cart_limit, -self.cfg.cart_limit - x,
-            torch.where(x > self.cfg.cart_limit,
-                       self.cfg.cart_limit - x,
-                       torch.zeros_like(x)))
-        f_limit = (self.cfg.limit_stiffness * violation
-                   - self.cfg.limit_damping * xd * (violation != 0.0))
+        f_limit = self._limit_force(q, qd)
 
         # --- solve the 2x2 linear system (see module docstring) ---
         rhs1 = force + f_limit + self.ml * s * thd.square()   # Eq. (1) RHS
@@ -191,6 +185,42 @@ class CartPoleSwingUpEnv(DifferentiableEnv):
         th_ddot = ((self.M + self.m) * rhs2 - self.ml * c * rhs1) / det
 
         return torch.stack([x_ddot, th_ddot], dim=-1)
+
+    def _limit_force(self, q: torch.Tensor, qd: torch.Tensor) -> torch.Tensor:
+        """Magnitude-signed joint-limit force on the cart (paper Eq. 4 plus
+        damping) at state (q, qd): 0 while the cart is inside its travel
+        limits. Extracted from _accelerations so the AHAC-inspired
+        stiffness() below can price the same force the dynamics apply."""
+        x, xd = q[:, 0], qd[:, 0]
+        violation = torch.where(
+            x < -self.cfg.cart_limit, -self.cfg.cart_limit - x,
+            torch.where(x > self.cfg.cart_limit,
+                       self.cfg.cart_limit - x,
+                       torch.zeros_like(x)))
+        return (self.cfg.limit_stiffness * violation
+                - self.cfg.limit_damping * xd * (violation != 0.0))
+
+    # ------------------------------------------------------------------
+    # AHAC-INSPIRED API (see DifferentiableEnv.stiffness): the cartpole's
+    # only "contact" is the soft prismatic-joint limit. Following the
+    # official AHAC rollout loop (imgeorgiev/DiffRL ahac.py, cfs[i] = ...):
+    #   cfs = || contact_forces / max(|accelerations|, 1) ||   over DoFs
+    # with contact_forces = [f_limit, 0] (the limit acts on the cart DoF
+    # only) and accelerations from the SAME equations of motion the
+    # simulator integrates. In practice this is 0 almost always -- the
+    # swing-up policy keeps the cart well inside +/-4 m -- so the AHAC
+    # dual on this task sees a contact-free world (AHAC.md, Prediction 0).
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def stiffness(self, action: torch.Tensor) -> torch.Tensor:
+        force = (self.cfg.action_strength * action).squeeze(-1)   # [N]
+        f_limit = self._limit_force(self.q, self.qd)              # [N]
+        acc = self._accelerations(self.q, self.qd, force)         # [N, 2]
+        # Per-DoF normalized force, then the L2 norm over the DoF axis
+        # (the official code's torch.norm(cfs_normalised, dim=(1, 2))).
+        contact = torch.stack([f_limit, torch.zeros_like(f_limit)], dim=-1)
+        cfs_normalised = contact / acc.abs().clamp(min=1.0)
+        return cfs_normalised.norm(dim=-1)
 
     def _integrate(self, q, qd, action):
         """Advance dt with `sim_substeps` semi-implicit Euler substeps.

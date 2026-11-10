@@ -64,6 +64,41 @@ NVlabs/DiffRL/algorithms/shac.py -- all marked "official:" below)
 * OBSERVATION NORMALIZATION statistics are frozen for the duration of one
   learning episode (so the whole window shares one normalization), while
   being updated online for use by subsequent episodes.
+
+------------------------------------------------------------------------------
+AHAC EXTENSION (config-gated; NOT part of native SHAC)
+------------------------------------------------------------------------------
+Georgiev et al., "Adaptive Horizon Actor-Critic" (ICML 2024) = SHAC plus
+three deltas, all OFF by default (repo convention: single-knob arms are
+"SHAC + AHAC-inspired <component>"; only --ahac = all three together is
+"AHAC"). Everything above this note is native SHAC; every AHAC-inspired
+addition below is marked. The deltas:
+
+  1. ADAPTIVE HORIZON (SHACConfig.horizon_mode="adaptive"): the window
+     length H adapts each episode by a Lagrangian dual on contact
+     stiffness (their Eq. 9-10), clipped to [steps_min, steps_max] = [8, 64]
+     (official ahac.yaml). Implementation notes from the official code
+     (imgeorgiev/DiffRL, src/shac/algorithms/ahac.py) that the paper's
+     equations do NOT show:
+       * the dual variable lambda NEVER enters the actor loss -- the actor
+         objective is plain SHAC Eq. 5; the constraint acts exclusively
+         through the H update (H += lr * lambda.sum());
+       * lambda is UNCLAMPED; on a contact-free env (cfs = 0 < C every
+         step) it therefore drifts negative without bound and H ratchets
+         to steps_min and stays there -- the mechanism's domain boundary,
+         analyzed in AHAC.md;
+       * stiffness cfs = ||contact_forces / max(|accel|, 1)|| per env-step
+         (DifferentiableEnv.stiffness; contact-free envs return zeros).
+  2. DOUBLE CRITIC (train.py --double-critic): two independent online
+     critics, min-pooled bootstrap, NO Polyak target network. This needs
+     NO new trainer code -- it is exactly the existing SAPO-inspired
+     combination critic_ensemble=2 + use_target_critic=False +
+     actor_bootstrap_pool="min" (SAPO design choice IV and AHAC delta 2
+     are the same mechanism).
+  3. ITERATIVE CRITIC (SHACConfig.iterative_critic): train the critic to
+     convergence EVERY episode -- up to iterative_critic_max passes with
+     early stopping when the last five pass losses flatline (official:
+     max 64, tol 2e-1) -- instead of native SHAC's fixed 16 passes.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -154,6 +189,53 @@ def td_lambda_values(rew_buf: torch.Tensor,
 
 
 # ===========================================================================
+# AHAC-INSPIRED pure helpers (horizon_mode="adaptive" / --iterative-critic;
+# NOT native SHAC). Kept module-level and side-effect-free so the dual
+# mechanics are unit-testable without building a trainer (tests/test_ahac.py).
+# Exact transcription of the official update loop:
+# imgeorgiev/DiffRL src/shac/algorithms/ahac.py --
+#   self.lambd -= lambd_lr * (self.C - self.cfs.mean(-1))
+#   self.H     += lambd_lr * self.lambd.sum()
+#   self.H      = torch.clip(self.H, self.steps_min, self.steps_max)
+#   (next buffers) self.lambd = self.lambd[0].repeat(self.steps_num)
+# ===========================================================================
+def ahac_dual_update(lambd: torch.Tensor, horizon: float,
+                     cfs_mean: torch.Tensor, contact_threshold: float,
+                     lambd_lr: float, steps_min: int,
+                     steps_max: int) -> Tuple[torch.Tensor, float]:
+    """One AHAC dual step; returns the updated (lambda, H).
+
+    lambd:    [h] per-STEP dual variables (one per rollout step; official
+              cfs.mean(-1) averages over ENVS, leaving a per-step vector).
+    cfs_mean: [h] per-step mean stiffness over envs for the CURRENT window.
+    Signs: a step BELOW threshold (cfs < C, the contact-free regime) makes
+    (C - cfs) > 0, so lambda DECREASES -- unclamped, it drifts negative
+    without bound -- and since H += lr * sum(lambda), H shrinks toward
+    steps_min. Above-threshold steps push lambda (and H) the other way.
+    """
+    lambd = lambd - lambd_lr * (contact_threshold - cfs_mean)
+    horizon = float(horizon + lambd_lr * float(lambd.sum()))
+    horizon = min(max(horizon, float(steps_min)), float(steps_max))
+    # Official init_buffers: lambda is re-tiled (lambda[0] repeated) to the
+    # NEW window length for the next episode.
+    lambd = lambd[0].repeat(round(horizon))
+    return lambd, horizon
+
+
+def ahac_critic_converged(last_pass_losses: List[float],
+                          tol: float) -> bool:
+    """AHAC-INSPIRED iterative-critic early-stop criterion (official:
+    critic_iterations=None, `abs(np.diff(last_losses).mean()) < 2e-1`
+    over a 5-element window of per-PASS mean losses). Needs a full window
+    of 5 pass losses before it can declare convergence."""
+    if len(last_pass_losses) < 5:
+        return False
+    w = last_pass_losses[-5:]
+    diffs = [b - a for a, b in zip(w, w[1:])]
+    return abs(sum(diffs) / len(diffs)) < tol
+
+
+# ===========================================================================
 # The trainer
 # ===========================================================================
 class SHACTrainer:
@@ -179,6 +261,26 @@ class SHACTrainer:
         self.num_actions = self.env.num_actions
         self.h = self.cfg.short_horizon          # h (window length)
         self.H = self.env.episode_length         # task horizon
+
+        # ---- AHAC-INSPIRED adaptive-horizon state (NOT native SHAC) ----
+        # horizon_mode="fixed" (default): this block is inert, self.h stays
+        # short_horizon, and the buffers use the native shape.
+        # horizon_mode="adaptive" (AHAC delta 1): the window length self.h
+        # CHANGES every episode (AHAC's H, a float rounded per episode);
+        # buffers are sized for the LARGEST window (steps_max) and the
+        # critic stage slices them to the current length. h_max is the
+        # buffer capacity in either mode.
+        if self.cfg.horizon_mode == "adaptive":
+            self.adaptive_horizon = True
+            self.h_max = self.cfg.steps_max
+            self.horizon_float = float(self.cfg.steps_min)   # AHAC's H
+            self.lambd = torch.zeros(self.cfg.steps_min, device=device)
+            self.h = self.cfg.steps_min    # current window = round(H)
+        else:
+            self.adaptive_horizon = False
+            self.h_max = self.cfg.short_horizon
+            self.horizon_float = float(self.cfg.short_horizon)
+            self.lambd = None
 
         # ---- actor and critics ----
         self.use_critic = self.cfg.use_critic
@@ -244,12 +346,18 @@ class SHACTrainer:
                         if self.cfg.obs_rms else None)
 
         # ---- rollout buffers (refilled every learning episode) ----
-        shape = (self.h, self.num_envs)
-        self.obs_buf = torch.zeros(self.h, self.num_envs, self.num_obs,
+        # Sized to the CAPACITY h_max (native: short_horizon; AHAC-inspired
+        # adaptive mode: steps_max -- see the block above).
+        shape = (self.h_max, self.num_envs)
+        self.obs_buf = torch.zeros(self.h_max, self.num_envs, self.num_obs,
                                    device=device)          # normalized s_t
         self.rew_buf = torch.zeros(*shape, device=device)  # r_t
         self.next_value_buf = torch.zeros(*shape, device=device)  # V'(s_{t+1})
         self.done_mask = torch.zeros(*shape, device=device)       # 1.0 at dones
+        # AHAC-INSPIRED: per-step contact stiffness cfs[i] = stiffness of the
+        # transition taken at step i (zeros unless horizon_mode="adaptive"
+        # and the env reports contact; consumed ONLY by the dual update).
+        self.cfs_buf = torch.zeros(*shape, device=device)
 
         # ---- per-env task-episode bookkeeping (for logging and for the
         #      timeout-vs-early-termination distinction) ----
@@ -408,6 +516,13 @@ class SHACTrainer:
                     ent_raw_sum += float(ent_raw.mean())
             else:
                 action = torch.tanh(self.actor(obs))
+
+            # ---- AHAC-INSPIRED: record the transition's contact stiffness
+            #      (no_grad inside the env API; it feeds the horizon dual,
+            #      never a gradient). Native SHAC never calls this -- the
+            #      base-class default is exact zeros.
+            if self.adaptive_horizon:
+                self.cfs_buf[i] = self.env.stiffness(action)
 
             # ---- differentiable simulator step ----
             obs_raw, rew, done, info = self.env.step(action)
@@ -653,6 +768,11 @@ class SHACTrainer:
         over the 16*4 = 64 inner gradient steps -- the pre-clip norm is
         what clip_grad_norm_ returns, matching actor_grad_norm."""
         # ---- target values V-tilde(s) for every state in the window ----
+        # AHAC-INSPIRED (horizon_mode="adaptive"): only the first h_cur rows
+        # of the capacity-sized buffers belong to THIS window (the rest is
+        # stale from longer past windows); native fixed-h runs have
+        # h_cur == h_max and every slice below is a no-op.
+        h_cur = self.h
         with torch.no_grad():
             # SOFT values under --max-entropy (SAPO Eq. 20): the td-(lambda)
             # recursion runs on r + alpha * hat{h} instead of r, with the
@@ -661,15 +781,18 @@ class SHACTrainer:
             # augmented return, matching what the actor's window loss
             # optimizes.
             if self.max_entropy:
-                soft_rew = self.rew_buf + self.entropy_alpha * self.ent_buf
+                soft_rew = self.rew_buf[:h_cur] \
+                    + self.entropy_alpha * self.ent_buf[:h_cur]
             else:
-                soft_rew = self.rew_buf
-            targets = td_lambda_values(soft_rew, self.next_value_buf,
-                                       self.done_mask, self.cfg.gamma,
-                                       self.cfg.td_lambda)     # [h, N]
+                soft_rew = self.rew_buf[:h_cur]
+            targets = td_lambda_values(soft_rew,
+                                       self.next_value_buf[:h_cur],
+                                       self.done_mask[:h_cur],
+                                       self.cfg.gamma,
+                                       self.cfg.td_lambda)     # [h_cur, N]
 
         # Flatten time-major: states [h*N, obs], targets [h*N].
-        obs_flat = self.obs_buf.reshape(-1, self.num_obs)
+        obs_flat = self.obs_buf[:h_cur].reshape(-1, self.num_obs)
         tgt_flat = targets.reshape(-1)
 
         # Official minibatching: `critic_num_batch` CONTIGUOUS slices of the
@@ -678,8 +801,23 @@ class SHACTrainer:
         batch_size = max(1, obs_flat.shape[0] // self.cfg.critic_num_batch)
         num_batches = (obs_flat.shape[0] + batch_size - 1) // batch_size
 
+        # Outer passes over the episode's data. NATIVE SHAC: a fixed count
+        # (critic_iterations, paper Table 4: 16). AHAC-INSPIRED
+        # (--iterative-critic): train to CONVERGENCE every episode -- up to
+        # iterative_critic_max passes, early-stopping when the last five
+        # pass losses flatline (official: max 64, tol 2e-1). The per-pass
+        # loss for the criterion is the mean over batches (and ensemble
+        # members) of this pass.
+        if self.cfg.iterative_critic:
+            max_passes = self.cfg.iterative_critic_max
+            last_pass_losses: List[float] = []
+        else:
+            max_passes = self.cfg.critic_iterations
+            last_pass_losses = None
+
         total_loss, total_gnorm, steps = 0.0, 0.0, 0
-        for _ in range(self.cfg.critic_iterations):
+        for _pass in range(max_passes):
+            pass_loss_sum, pass_steps = 0.0, 0
             for b in range(num_batches):
                 idx = slice(b * batch_size, min((b + 1) * batch_size,
                                                  obs_flat.shape[0]))
@@ -715,6 +853,16 @@ class SHACTrainer:
                     total_loss += float(loss.item())
                     total_gnorm += float(gnorm.item())
                     steps += 1
+                    pass_loss_sum += float(loss.item())
+                    pass_steps += 1
+            # AHAC-INSPIRED early stop (native fixed-count loop never hits
+            # this branch: last_pass_losses is None). Mirrors the official
+            # criterion; their check-order differs by at most one pass.
+            if last_pass_losses is not None:
+                last_pass_losses.append(pass_loss_sum / max(pass_steps, 1))
+                if ahac_critic_converged(
+                        last_pass_losses, self.cfg.iterative_critic_tol):
+                    break
         n = max(steps, 1)
         return total_loss / n, total_gnorm / n
 
@@ -730,6 +878,38 @@ class SHACTrainer:
                 for p, p_tgt in zip(critic.parameters(),
                                     target.parameters()):
                     p_tgt.data.mul_(alpha).add_(p.data, alpha=1.0 - alpha)
+
+    # ======================================================================
+    # AHAC-INSPIRED: the adaptive-horizon dual step (NOT native SHAC --
+    # runs once per learning episode, only under horizon_mode="adaptive").
+    # ======================================================================
+    def _update_horizon(self, episode: int) -> Optional[Dict[str, float]]:
+        """AHAC delta 1: adapt the window length H via the Lagrangian dual
+        on contact stiffness (paper Eq. 9-10; official ahac.py lines --
+        see ahac_dual_update for the exact transcription). Called at the
+        END of each learning episode, so the cfs_buf still holds THIS
+        episode's training window (the gradient-variance diagnostic's
+        extra windows, when enabled, ran BEFORE it).
+
+        Returns the logging dict {horizon_H, lambd_mean, cfs_mean}, or
+        None in native fixed-horizon mode (the caller then logs Nones so
+        the CSV schema is identical across arms)."""
+        if not self.adaptive_horizon:
+            return None
+        cfs_mean = self.cfs_buf[:self.h].mean(dim=1)     # per-step [h]
+        # Dual step size: linear decay like the network LRs (official
+        # lr_schedule: linear -> (1e-5 - lambd_lr) * frac + lambd_lr).
+        frac = min(1.0, (episode - 1) / max(self.cfg.num_episodes, 1))
+        lr = ((self.cfg.lambd_lr_final - self.cfg.lambd_lr) * frac
+              + self.cfg.lambd_lr)
+        self.lambd, self.horizon_float = ahac_dual_update(
+            self.lambd, self.horizon_float, cfs_mean,
+            self.cfg.contact_threshold, lr,
+            self.cfg.steps_min, self.cfg.steps_max)
+        self.h = round(self.horizon_float)
+        return {"horizon_H": self.horizon_float,
+                "lambd_mean": float(self.lambd.mean()),
+                "cfs_mean": float(cfs_mean.mean())}
 
     # ======================================================================
     # Main training loop
@@ -776,6 +956,18 @@ class SHACTrainer:
                 # cells so the CSV schema is identical across arms.
                 stats["critic_loss"] = None
                 stats["critic_grad_norm"] = None
+
+            # ---- AHAC-INSPIRED: adaptive-horizon dual step ----
+            hor = self._update_horizon(episode)
+            if hor is not None:
+                stats.update(hor)
+            else:
+                # Native fixed-horizon mode: empty cells keep the CSV
+                # schema identical across arms (same convention as the
+                # eval/grad-var columns).
+                stats["horizon_H"] = None
+                stats["lambd_mean"] = None
+                stats["cfs_mean"] = None
 
             # Sparse diagnostic columns (None between measurements, like
             # the eval columns between evals). Always present so every row
@@ -909,6 +1101,13 @@ class SHACTrainer:
             # ignore it.
             "entropy_alpha": (float(self.entropy_alpha)
                               if self.max_entropy else None),
+            # AHAC-INSPIRED adaptive-horizon loop state (None in native
+            # fixed-horizon mode): H and the per-step dual variables, so
+            # --resume continues the dual where it left off.
+            "ahac_horizon": (float(self.horizon_float)
+                             if self.adaptive_horizon else None),
+            "ahac_lambd": (self.lambd.tolist()
+                           if self.adaptive_horizon else None),
             # ---- training-loop state (for --resume) ----
             "episode": self._episode,
             "total_env_steps": self.total_env_steps,
@@ -963,6 +1162,15 @@ class SHACTrainer:
         # the field entirely).
         if (self.max_entropy and ckpt.get("entropy_alpha") is not None):
             self.entropy_alpha = float(ckpt["entropy_alpha"])
+        # AHAC-INSPIRED: restore H and the dual variables (absent in
+        # native fixed-horizon checkpoints and pre-AHAC saves -> fresh).
+        if (self.adaptive_horizon
+                and ckpt.get("ahac_horizon") is not None):
+            self.horizon_float = float(ckpt["ahac_horizon"])
+            self.lambd = torch.tensor(ckpt["ahac_lambd"],
+                                      dtype=torch.float32,
+                                      device=self.device)
+            self.h = round(self.horizon_float)
         # Training-loop state (absent in pre-resume checkpoints -> fresh).
         self.total_env_steps = int(ckpt.get("total_env_steps", 0))
         self._episode = int(ckpt.get("episode", 0))
@@ -981,6 +1189,12 @@ class SHACTrainer:
                f"| critic_loss {cl} "
                f"| std {row['policy_std']:.3f} "
                f"| lr {row['lr_actor']:.2e}")
+        if row.get("horizon_H") is not None:
+            # AHAC-INSPIRED adaptive horizon: window length, dual mean and
+            # mean stiffness (the Prediction-0 evidence in AHAC.md).
+            msg += (f" | H {row['horizon_H']:5.1f}"
+                    f" | lam {row['lambd_mean']:+8.2f}"
+                    f" | cfs {row['cfs_mean']:6.2f}")
         if row["train_return_mean"] is not None:
             msg += f" | train_ret {row['train_return_mean']:8.1f}"
         if row.get("entropy_alpha") is not None:

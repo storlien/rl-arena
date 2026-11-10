@@ -91,6 +91,26 @@ class DifferentiableEnv:
         backpropagation."  This is the method that performs the cut."""
         raise NotImplementedError
 
+    def stiffness(self, action: torch.Tensor) -> torch.Tensor:
+        """AHAC-INSPIRED API (not part of native SHAC -- Georgiev et al.,
+        "Adaptive Horizon Actor-Critic", ICML 2024): the per-env normalized
+        contact-stiffness norm for the transition (current internal state,
+        `action`):
+
+            cfs_i = || contact_forces_i / max(|accelerations_i|, 1) ||
+
+        (the official normalization diag(max(qhat, 1))^{-1}, giving one
+        threshold C usable across tasks). This is the quantity AHAC's
+        adaptive-horizon dual constrains (their Eq. 9-10); the trainer
+        calls it once per rollout step, ONLY under horizon_mode="adaptive",
+        always under torch.no_grad() (it feeds the dual update, never a
+        gradient). Contact-free envs return exact zeros -- which is the
+        mechanism's domain boundary on this repo's two tasks (AHAC.md).
+
+        Returns: [num_envs] float tensor.
+        """
+        return torch.zeros(self.num_envs, dtype=torch.float32,
+                           device=self.device)
     def save_state(self) -> Dict[str, torch.Tensor]:
         """Snapshot of the full simulator state (for MPC rollouts / eval)."""
         raise NotImplementedError
